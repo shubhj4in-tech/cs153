@@ -1,0 +1,65 @@
+# ============================================================
+# 4D Scene Reconstruction — pinned dependencies
+# Install order matters: torch first, then CUDA extensions.
+# ============================================================
+
+# ── Core PyTorch (CUDA 12.1) ──────────────────────────────
+torch==2.3.0+cu121
+torchvision==0.18.0+cu121
+torchaudio==2.3.0+cu121
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# ── Diffusers stack ───────────────────────────────────────
+diffusers>=0.30.0
+transformers>=4.40.0
+peft>=0.11.0
+accelerate>=0.30.0
+safetensors>=0.4.3
+
+# ── Memory-efficient training ─────────────────────────────
+# unsloth is optional; falls back to standard HF trainer if unavailable
+# unsloth[cu121-torch230] @ git+https://github.com/unslothai/unsloth
+
+# ── Experiment tracking ───────────────────────────────────
+wandb>=0.17.0
+
+# ── Vision / image processing ────────────────────────────
+opencv-python>=4.9.0
+imageio>=2.34.0
+imageio-ffmpeg>=0.5.0
+Pillow>=10.3.0
+scikit-image>=0.22.0
+lpips>=0.1.4
+
+# ── 3D / geometry ────────────────────────────────────────
+plyfile>=1.0.3
+open3d>=0.18.0
+trimesh>=4.3.0
+
+# ── Scientific computing ──────────────────────────────────
+numpy>=1.26.0
+scipy>=1.13.0
+einops>=0.7.0
+
+# ── Config / CLI ──────────────────────────────────────────
+omegaconf>=2.3.0
+tqdm>=4.66.0
+tyro>=0.7.3
+rich>=13.7.0
+
+# ── Modal (cloud GPU) ────────────────────────────────────
+modal>=0.63.0
+
+# ── Optical flow (RAFT via torchvision) ──────────────────
+# torchvision already listed above; RAFT weights downloaded at runtime
+
+# ── ffmpeg Python wrapper ────────────────────────────────
+ffmpeg-python>=0.2.0
+
+# ── Evaluation ───────────────────────────────────────────
+matplotlib>=3.8.0
+pandas>=2.2.0
+seaborn>=0.13.0
+
+# ── Jupyter (optional, for exploration) ──────────────────
+# jupyterlab>=4.0.0

@@ -1,0 +1,51 @@
+# Secrets — never commit
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+
+# Models (large binaries)
+models/
+*.pth
+*.pt
+*.safetensors
+*.bin
+
+# Outputs
+outputs/
+data/synthetic/
+
+# Viewer
+viewer/node_modules/
+viewer/dist/
+viewer/public/*.splat
+viewer/public/manifest.json
+
+# Scene data
+**/frames/
+**/flow_frames/
+**/bg_frames/
+**/fg_frames/
+**/fg_masks/
+**/flow_maps/
+**/depth/
+**/cameras.json
+**/pointcloud.ply
+**/frames_meta.json
+
+# Submodule build artifacts
+gaussian-splatting/
+Deformable-3D-Gaussians/
+dust3r/
+sam2/
+GaussianSplats3D/
+
+# Misc
+.DS_Store
+*.egg
+wandb/
