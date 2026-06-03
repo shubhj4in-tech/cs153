@@ -77,12 +77,12 @@ pipeline_image = (
         "git clone --depth 1 https://github.com/apple/ml-depth-pro /opt/ml-depth-pro",
         "pip install -e /opt/ml-depth-pro",
     )
-    # Clone DUSt3R — no setup.py so just install deps and rely on PYTHONPATH
-    # Skip safetensors from dust3r deps to avoid downgrade conflict with diffusers
+    # Clone DUSt3R and install (filter safetensors to avoid downgrade conflict)
     .run_commands(
         "git clone --depth 1 https://github.com/naver/dust3r /opt/dust3r",
         "grep -v safetensors /opt/dust3r/requirements.txt > /tmp/dust3r_req_filtered.txt || true",
         "pip install -r /tmp/dust3r_req_filtered.txt",
+        "pip install -e /opt/dust3r",
     )
     # Clone SAM2 and install
     .run_commands(

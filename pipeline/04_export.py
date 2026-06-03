@@ -181,14 +181,29 @@ def load_deformable_gaussians(fg_ckpt_dir: Path, timestamp: float) -> dict:
         return gauss
 
     # ── Load MLP ──────────────────────────────────────────────────────────────
-    # VERIFY: Import path matches the Deformable-3DGS package structure.
-    # The MLP class is typically in scene/deformation.py or utils/deform_model.py
+    # Deformable-3D-Gaussians (ingra14m) uses DeformNetwork in scene/deformation.py.
+    # We try multiple names for forward-compatibility.
     try:
         sys.path.insert(0, "/opt/deformable-3dgs")
-        from scene.deformation import DeformationNetwork   # VERIFY class name
+        deform_cls = None
+        for mod_path, cls_name in [
+            ("scene.deformation", "DeformNetwork"),
+            ("scene.deformation", "DeformationNetwork"),
+            ("utils.deform_model", "DeformModel"),
+        ]:
+            try:
+                mod = __import__(mod_path, fromlist=[cls_name])
+                deform_cls = getattr(mod, cls_name)
+                break
+            except (ImportError, AttributeError):
+                continue
+
+        if deform_cls is None:
+            raise ImportError("Could not find deformation MLP class in Deformable-3DGS")
+
         mlp_state = torch.load(str(mlp_path), map_location="cpu")
-        mlp = DeformationNetwork()
-        mlp.load_state_dict(mlp_state)
+        mlp = deform_cls()
+        mlp.load_state_dict(mlp_state, strict=False)
         mlp.eval()
     except (ImportError, Exception) as e:
         print(f"  WARNING: Could not load deformation MLP ({e}). "
@@ -202,19 +217,18 @@ def load_deformable_gaussians(fg_ckpt_dir: Path, timestamp: float) -> dict:
     sc_t     = torch.from_numpy(gauss["scales"])       # (N, 3)
 
     with torch.no_grad():
-        # VERIFY: exact call signature of DeformationNetwork.forward()
-        # Typical: (xyz, time) → (delta_xyz, delta_rot, delta_scale)
         delta = mlp(pos_t, t_tensor)
 
-    if isinstance(delta, (tuple, list)) and len(delta) == 3:
-        d_pos, d_rot, d_sc = delta
+    if isinstance(delta, (tuple, list)) and len(delta) >= 3:
+        d_pos, d_rot, d_sc = delta[0], delta[1], delta[2]
         gauss["positions"] = (pos_t + d_pos).numpy().astype(np.float32)
         gauss["rotations"] = (rot_t + d_rot).numpy().astype(np.float32)
         gauss["scales"]    = (sc_t  + d_sc).numpy().astype(np.float32)
-    else:
-        # Some versions return just delta_xyz
-        d_pos = delta if isinstance(delta, torch.Tensor) else delta[0]
+    elif isinstance(delta, (tuple, list)):
+        d_pos = delta[0]
         gauss["positions"] = (pos_t + d_pos).numpy().astype(np.float32)
+    else:
+        gauss["positions"] = (pos_t + delta).numpy().astype(np.float32)
 
     return gauss
 

@@ -128,13 +128,13 @@ def extract_motion_embeddings(
     pipeline = CogVideoXPipeline.from_pretrained(
         model_id, torch_dtype=torch.bfloat16
     )
+    vae         = pipeline.vae.to(device).eval()
     transformer = pipeline.transformer.to(device)
 
     lora_adapter_path = Path(lora_dir) / "lora_adapter"
     if lora_adapter_path.exists():
         print(f"  Loading LoRA adapter from {lora_adapter_path} ...")
-        # VERIFY: The LoRA adapter was saved on a module-list; re-wrap to load
-        from peft import PeftConfig
+        # The adapter was saved via transformer.save_pretrained() after get_peft_model()
         transformer = PeftModel.from_pretrained(transformer, str(lora_adapter_path))
     else:
         print(f"  WARNING: LoRA adapter not found at {lora_adapter_path}. "
@@ -183,14 +183,22 @@ def extract_motion_embeddings(
         video_frames.append(video_frames[-1].clone())
 
     video = torch.stack(video_frames, dim=0).unsqueeze(0).to(device, dtype=torch.bfloat16)
-    # video: (1, T, 3, H, W) → rearrange to (1, 3, T, H, W) for CogVideoX
-    video = video.permute(0, 2, 1, 3, 4)
+    # video: (1, T, 3, H, W)
 
-    # Approximate latent (4x downscale, bypassing VAE for speed)
-    latent = F.avg_pool3d(video, kernel_size=(1, 4, 4), stride=(1, 4, 4))
+    # Encode through the VAE to get proper latents.
+    B = 1
+    T_actual = video.shape[1]
+    with torch.no_grad():
+        frames_flat = video.reshape(T_actual, 3, height, width)
+        latents_flat = vae.encode(frames_flat).latent_dist.sample()
+        latents_flat = latents_flat * vae.config.scaling_factor
+    latent_C = latents_flat.shape[1]
+    latent_h = latents_flat.shape[2]
+    latent_w = latents_flat.shape[3]
+    latent = latents_flat.reshape(1, T_actual, latent_C, latent_h, latent_w)
+    latent = latent.permute(0, 2, 1, 3, 4)   # (1, latent_C, T, latent_h, latent_w)
 
     hidden_size = getattr(transformer.config, "hidden_size", 3072)
-    B = 1
 
     # ── Single forward pass to extract features ───────────────────────────────
     print("  Running single forward pass for feature extraction ...")
@@ -223,12 +231,11 @@ def extract_motion_embeddings(
 
     # ── Build 2D feature maps from sequence features ──────────────────────────
     # Each hook gives (1, seq_len, D).
-    # seq_len = T * (H//8) * (W//8) when using the full transformer.
-    # Reshape into spatial maps to sample per-Gaussian.
+    # seq_len = T * latent_h * latent_w (spatial dims after VAE encoding).
 
-    feat_H = height // 8    # spatial downscale inside transformer
-    feat_W = width  // 8
-    feat_T = clip_len
+    feat_H = latent_h
+    feat_W = latent_w
+    feat_T = T_actual
 
     # Average feature maps across layers
     feat_sum    = None

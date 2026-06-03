@@ -35,7 +35,7 @@ import sys
 from pathlib import Path
 
 import modal
-from modal_config import app, training_image, VOLUME_MAP, DATA_PATH, MODELS_PATH
+from modal_config import app, training_image, VOLUME_MAP, DATA_PATH, MODELS_PATH, data_volume
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -80,7 +80,7 @@ def modal_finetune(
         max_steps=max_steps,
         output_dir=output_dir,
     )
-    modal.Volume.commit(VOLUME_MAP[DATA_PATH])
+    data_volume.commit()
 
 
 @app.function(
@@ -117,7 +117,7 @@ def modal_extract_features(
         output_path=str(Path(DATA_PATH) / output_relative),
         model_id=effective_model_id,
     )
-    modal.Volume.commit(VOLUME_MAP[DATA_PATH])
+    data_volume.commit()
 
 
 @app.function(
@@ -148,7 +148,7 @@ def modal_warm_init(
         output_path=str(Path(DATA_PATH) / output_relative),
         epochs=epochs,
     )
-    modal.Volume.commit(VOLUME_MAP[DATA_PATH])
+    data_volume.commit()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

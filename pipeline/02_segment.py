@@ -217,24 +217,24 @@ def split_fg_bg(frames_dir: Path, fg_masks_dir: Path,
     msk   = np.stack(masks,  axis=0)                      # (N, H, W) bool
 
     # Compute background median: for each pixel, median over frames where mask=0
-    # To keep memory reasonable, process row by row
-    bg_median = np.zeros((H, W, 3), dtype=np.float32)
-    bg_mask_avail = ~msk                                   # True where bg is visible
+    # Vectorised: stack is (N, H, W, 3); msk is (N, H, W) bool.
+    bg_mask_avail = ~msk   # True where pixel is background in that frame
 
-    print("[Stage 2] Computing background median (this may take a moment) ...")
-    for row in range(H):
-        for ch in range(3):
-            col_stack = stack[:, row, :, ch]    # (N, W)
-            bg_vis    = bg_mask_avail[:, row, :] # (N, W)
-            # For each column pixel, take median of visible bg values
-            for col in range(W):
-                vals = col_stack[bg_vis[:, col], col]
-                if len(vals) > 0:
-                    bg_median[row, col, ch] = np.median(vals)
-                else:
-                    bg_median[row, col, ch] = col_stack[:, col].mean()
+    print("[Stage 2] Computing background median ...")
+    # Use a masked sort: set foreground pixels to NaN then nanmedian.
+    stack_masked = stack.copy()
+    stack_masked[msk] = np.nan   # (N, H, W, 3)
 
-    bg_median = bg_median.astype(np.uint8)
+    # nanmedian over the frame axis — O(N*H*W*3) but fully vectorised.
+    bg_median = np.nanmedian(stack_masked, axis=0)   # (H, W, 3)
+
+    # Any pixel always covered by foreground (all NaN) → use global mean fallback.
+    always_fg = np.all(msk, axis=0)   # (H, W)
+    if always_fg.any():
+        global_mean = np.nanmean(stack_masked.reshape(N, -1, 3), axis=(0, 1))
+        bg_median[always_fg] = global_mean
+
+    bg_median = np.nan_to_num(bg_median, nan=0.0).astype(np.uint8)
 
     per_frame_meta = []
     for i, (fp, mask) in enumerate(zip(frame_files, masks)):

@@ -134,14 +134,14 @@ class MotionProjection(nn.Module):
 def load_blender_gt_deformations(manifest_path: str, n_points: int = 2000,
                                   n_scenes: int = 100) -> tuple:
     """
-    Extract ground-truth (position, time, deformation) triples from
-    Blender depth maps: for each scene, use depth + camera intrinsics to get
-    3D point positions, then compute deformation as displacement from frame 0.
+    Extract ground-truth (position, time, deformation, scene_index) triples from
+    Blender depth maps.
 
     Returns:
-        pts:   (M, 3) float32 — world-space positions at t=0
-        times: (M, 1) float32 — normalised time [0, 1]
-        deforms: (M, 10) float32 — target deformation (Δxyz + zeros for rot/scale)
+        pts:         (M, 3) float32 — world-space positions at t=0
+        times:       (M, 1) float32 — normalised time [0, 1]
+        deforms:     (M, 10) float32 — target deformation (Δxyz + zeros for rot/scale)
+        scene_idxs:  (M,) int64 — which scene each point belongs to
     """
     import imageio
     from PIL import Image
@@ -152,8 +152,9 @@ def load_blender_gt_deformations(manifest_path: str, n_points: int = 2000,
     all_pts     = []
     all_times   = []
     all_deforms = []
+    all_sidxs   = []
 
-    for sc in valid:
+    for sc_num, sc in enumerate(valid):
         depth_dir  = Path(sc["depth_dir"])
         render_dir = Path(sc["render_dir"])
         n_frames   = sc["n_frames"]
@@ -226,6 +227,7 @@ def load_blender_gt_deformations(manifest_path: str, n_points: int = 2000,
             all_pts.append(pts0[idx0])
             all_times.append(t_t[idx_t])
             all_deforms.append(deform_10)
+            all_sidxs.append(np.full(n_match, sc_num, dtype=np.int64))
 
     if not all_pts:
         raise RuntimeError(
@@ -233,11 +235,133 @@ def load_blender_gt_deformations(manifest_path: str, n_points: int = 2000,
             "Check that blender_render.py produced depth EXR files."
         )
 
-    pts     = np.concatenate(all_pts,     axis=0)
-    times   = np.concatenate(all_times,   axis=0)
-    deforms = np.concatenate(all_deforms, axis=0)
+    pts      = np.concatenate(all_pts,     axis=0)
+    times    = np.concatenate(all_times,   axis=0)
+    deforms  = np.concatenate(all_deforms, axis=0)
+    sidxs    = np.concatenate(all_sidxs,   axis=0)
     print(f"  Loaded {len(pts)} (position, time, deformation) triples from {len(valid)} scenes")
-    return pts, times, deforms
+    return pts, times, deforms, sidxs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-scene CogVideoX embedding extraction (synthetic scenes)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_synthetic_scene_embeddings(
+    manifest_path: str,
+    model_id: str = "zai-org/CogVideoX-5b-I2V",
+    lora_dir: str | None = None,
+    n_scenes: int = 100,
+    clip_len: int = 8,
+    size: int = 256,
+    target_blocks: tuple = (12, 13, 14, 15, 16, 17, 18),
+    cache_path: str | None = None,
+) -> torch.Tensor:
+    """
+    Extract a single global CogVideoX embedding (D,) per Blender scene.
+
+    Returns:
+        embeddings: (n_valid_scenes, D) float32 — one embedding per scene,
+                    in the same order as valid scenes in the manifest.
+    """
+    import torchvision.transforms.functional as TF
+    from PIL import Image
+    from diffusers import CogVideoXPipeline
+
+    # Check cache
+    if cache_path and Path(cache_path).exists():
+        print(f"[WarmInit] Loading cached synthetic embeddings from {cache_path}")
+        return torch.load(cache_path, map_location="cpu")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"[WarmInit] Loading CogVideoX for synthetic embedding extraction ...")
+    pipeline = CogVideoXPipeline.from_pretrained(model_id, torch_dtype=torch.bfloat16)
+    vae = pipeline.vae.to(device).eval()
+    transformer = pipeline.transformer.to(device).eval()
+    hidden_size = getattr(transformer.config, "hidden_size", 3072)
+
+    if lora_dir:
+        from peft import PeftModel
+        lora_path = Path(lora_dir) / "lora_adapter"
+        if lora_path.exists():
+            transformer = PeftModel.from_pretrained(transformer, str(lora_path))
+            print(f"  Loaded LoRA from {lora_path}")
+
+    for p in transformer.parameters():
+        p.requires_grad_(False)
+    for p in vae.parameters():
+        p.requires_grad_(False)
+
+    manifest = json.loads(Path(manifest_path).read_text())
+    valid = [s for s in manifest if "error" not in s][:n_scenes]
+
+    scene_embeddings = []
+
+    for sc_num, sc in enumerate(valid):
+        render_dir = Path(sc["render_dir"])
+        frame_files = sorted(render_dir.glob("frame_*.png"))[:clip_len]
+        if not frame_files:
+            scene_embeddings.append(torch.zeros(hidden_size))
+            continue
+
+        frames = []
+        for fp in frame_files:
+            img = Image.open(fp).convert("RGB").resize((size, size), Image.BILINEAR)
+            frames.append(TF.to_tensor(img) * 2.0 - 1.0)
+        while len(frames) < clip_len:
+            frames.append(frames[-1].clone())
+
+        video = torch.stack(frames).to(device, dtype=torch.bfloat16)   # (T, 3, H, W)
+
+        with torch.no_grad():
+            latents = vae.encode(video).latent_dist.sample()
+            latents = latents * vae.config.scaling_factor              # (T, C, h, w)
+            latent = latents.unsqueeze(0).permute(0, 2, 1, 3, 4)      # (1, C, T, h, w)
+
+            layer_feats: dict[int, torch.Tensor] = {}
+
+            def make_hook(i: int):
+                def hook(mod, inp, out):
+                    feat = out[0] if isinstance(out, tuple) else out
+                    layer_feats[i] = feat.detach().mean(dim=(0, 1)).cpu()  # (D,)
+                return hook
+
+            hooks = [
+                transformer.transformer_blocks[i].register_forward_hook(make_hook(i))
+                for i in target_blocks
+                if i < len(transformer.transformer_blocks)
+            ]
+            try:
+                _ = transformer(
+                    hidden_states=latent,
+                    timestep=torch.zeros(1, dtype=torch.long, device=device),
+                    encoder_hidden_states=torch.zeros(
+                        1, 1, hidden_size, device=device, dtype=torch.bfloat16
+                    ),
+                    return_dict=False,
+                )
+            finally:
+                for h in hooks:
+                    h.remove()
+
+        if layer_feats:
+            scene_emb = torch.stack(list(layer_feats.values())).mean(dim=0)  # (D,)
+        else:
+            scene_emb = torch.zeros(hidden_size)
+
+        scene_embeddings.append(scene_emb.float())
+        print(f"  Scene {sc_num+1}/{len(valid)}", end="\r")
+
+    print()
+    result = torch.stack(scene_embeddings, dim=0)   # (n_scenes, D)
+
+    if cache_path:
+        Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+        torch.save(result, cache_path)
+        print(f"  Cached synthetic embeddings → {cache_path}")
+
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -251,24 +375,54 @@ def train_projection(
     epochs: int    = 50,
     lr: float      = 1e-3,
     batch_size: int = 256,
+    synthetic_embeddings_path: str | None = None,
+    model_id: str = "zai-org/CogVideoX-5b-I2V",
+    lora_dir: str | None = None,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ── Load real-scene motion embeddings ─────────────────────────────────────
-    print(f"[WarmInit] Loading motion embeddings from {embeddings_path} ...")
-    embeddings = torch.load(embeddings_path, map_location="cpu")  # (N, D)
-    N_gauss, D_feat = embeddings.shape
+    # ── Load real-scene motion embeddings (for final weight generation) ───────
+    print(f"[WarmInit] Loading real-scene embeddings from {embeddings_path} ...")
+    real_embeddings = torch.load(embeddings_path, map_location="cpu")  # (N, D)
+    N_gauss, D_feat = real_embeddings.shape
     print(f"  Shape: {N_gauss} Gaussians × {D_feat}-dim features")
 
     # ── Load synthetic GT deformations ────────────────────────────────────────
     print(f"[WarmInit] Loading Blender GT deformations from {blender_manifest} ...")
-    pts_np, times_np, deforms_np = load_blender_gt_deformations(blender_manifest)
+    pts_np, times_np, deforms_np, sidxs_np = load_blender_gt_deformations(blender_manifest)
+
+    n_syn_scenes = int(sidxs_np.max()) + 1
 
     pts     = torch.from_numpy(pts_np).to(device)
     times   = torch.from_numpy(times_np).to(device)
     deforms = torch.from_numpy(deforms_np).to(device)
+    sidxs   = torch.from_numpy(sidxs_np)   # kept on CPU for indexing
 
-    # ── Deformation MLP (fixed architecture for target weight extraction) ─────
+    # ── Get or compute synthetic scene embeddings ─────────────────────────────
+    syn_emb_cache = str(Path(blender_manifest).parent / "synthetic_scene_embeddings.pt")
+    if synthetic_embeddings_path and Path(synthetic_embeddings_path).exists():
+        syn_scene_embs = torch.load(synthetic_embeddings_path, map_location="cpu")
+        print(f"  Loaded synthetic embeddings from {synthetic_embeddings_path}")
+    else:
+        print("[WarmInit] Extracting CogVideoX embeddings from Blender scenes ...")
+        print("  (This runs once; result cached at synthetic_scene_embeddings.pt)")
+        syn_scene_embs = extract_synthetic_scene_embeddings(
+            manifest_path=blender_manifest,
+            model_id=model_id,
+            lora_dir=lora_dir,
+            n_scenes=n_syn_scenes,
+            cache_path=syn_emb_cache,
+        )
+
+    # syn_scene_embs: (n_scenes, D)
+    if syn_scene_embs.shape[0] < n_syn_scenes:
+        # Pad with zeros if fewer scenes were extracted
+        pad = torch.zeros(n_syn_scenes - syn_scene_embs.shape[0], D_feat)
+        syn_scene_embs = torch.cat([syn_scene_embs, pad], dim=0)
+
+    syn_scene_embs = syn_scene_embs.to(device)
+
+    # ── Deformation MLP ───────────────────────────────────────────────────────
     mlp = DeformationMLP(hidden=256).to(device)
 
     # ── Projection network ────────────────────────────────────────────────────
@@ -278,35 +432,30 @@ def train_projection(
     # ── Training ─────────────────────────────────────────────────────────────
     print(f"[WarmInit] Training projection for {epochs} epochs ...")
 
-    n_syn   = len(pts)
+    n_total   = len(pts)
     best_loss = float("inf")
 
     for epoch in range(epochs):
-        # Shuffle
-        perm = torch.randperm(n_syn)
+        perm = torch.randperm(n_total)
         epoch_loss = 0.0
         n_batches  = 0
 
-        for start in range(0, n_syn, batch_size):
-            idx = perm[start : start + batch_size]
+        for start in range(0, n_total, batch_size):
+            idx    = perm[start : start + batch_size]
             b_pts  = pts[idx]
             b_time = times[idx]
             b_def  = deforms[idx]
 
-            # Use random Gaussian embeddings from real scene
-            # (approximation: we don't have exact correspondence)
-            g_idx = torch.randint(0, N_gauss, (len(idx),))
-            b_emb = embeddings[g_idx].to(device)
+            # Use embeddings from the CORRECT synthetic scene for each point.
+            # sidxs[idx] gives which Blender scene each point came from.
+            b_scene_idx = sidxs[idx]   # (batch,) int64
+            b_emb = syn_scene_embs[b_scene_idx]   # (batch, D) — proper correspondence
 
-            # Project embeddings → first-layer weights
-            W_pred = proj(b_emb)   # (batch, 256, 4) — predicted first-layer weight matrix
+            W_pred = proj(b_emb)   # (batch, 256, 4)
 
-            # Apply predicted weights to position+time input and run rest of MLP
-            inp      = torch.cat([b_pts, b_time], dim=-1)   # (batch, 4)
-            # First layer: manual matmul using predicted weights
-            h0 = F.relu(torch.bmm(W_pred, inp.unsqueeze(-1)).squeeze(-1))  # (batch, 256)
+            inp = torch.cat([b_pts, b_time], dim=-1)   # (batch, 4)
+            h0  = F.relu(torch.bmm(W_pred, inp.unsqueeze(-1)).squeeze(-1))  # (batch, 256)
 
-            # Continue with frozen MLP layers (from layer 1 onward)
             with torch.no_grad():
                 h = h0
                 for i, layer in enumerate(mlp.layers[1:], start=1):
@@ -335,26 +484,21 @@ def train_projection(
     if best_loss > FLAG_THRESHOLD:
         print(
             f"\n  FLAG: Best training loss = {best_loss:.4f} > {FLAG_THRESHOLD}.\n"
-            f"  The domain gap between synthetic Blender and real data may be too large.\n"
-            f"  Come back and we will:\n"
-            f"    (a) Add a domain adaptation module\n"
-            f"    (b) Scale down the projection learning rate\n"
-            f"    (c) Use a deeper projection network\n"
-            f"    (d) Fall back to random initialisation (still runs, just slower convergence)\n"
+            f"  Domain gap between synthetic and real data may be too large.\n"
+            f"  Options: (a) add domain adaptation, (b) lower lr, "
+            f"(c) deeper projection, (d) fall back to random init.\n"
         )
     else:
         print(f"\n  Good convergence: best loss = {best_loss:.4f} < {FLAG_THRESHOLD}")
 
     # ── Apply projection to real scene embeddings ─────────────────────────────
-    print(f"\n[WarmInit] Generating warm weights for {N_gauss} Gaussians ...")
+    print(f"\n[WarmInit] Generating warm weights for {N_gauss} real-scene Gaussians ...")
     proj.eval()
     with torch.no_grad():
-        # Average the projected first-layer weights over all Gaussians
-        emb_batches = embeddings.to(device).split(1024)
+        emb_batches = real_embeddings.to(device).split(1024)
         W_all = torch.cat([proj(b) for b in emb_batches], dim=0)   # (N, 256, 4)
-        W_mean = W_all.mean(dim=0)   # (256, 4) — mean initial weights
+        W_mean = W_all.mean(dim=0)   # (256, 4)
 
-    # Build a state dict for the MLP with warm first layer
     warm_state = mlp.state_dict()
     warm_state["layers.0.weight"] = W_mean.cpu()
     warm_state["layers.0.bias"]   = torch.zeros(256)
@@ -372,7 +516,7 @@ def main():
         description="Train warm initialisation for Deformable-3DGS deformation MLP."
     )
     parser.add_argument("--embeddings",   required=True,
-                        help="Path to motion_embeddings.pt")
+                        help="Path to real-scene motion_embeddings.pt")
     parser.add_argument("--blender-dir",  default=None,
                         help="Path to Blender manifest.json OR its parent directory")
     parser.add_argument("--output",       default="./outputs/warm_deform_weights.pt",
@@ -380,9 +524,15 @@ def main():
     parser.add_argument("--epochs",       type=int, default=50)
     parser.add_argument("--lr",           type=float, default=1e-3)
     parser.add_argument("--batch-size",   type=int, default=256)
+    parser.add_argument("--synthetic-embeddings", default=None,
+                        help="Pre-computed synthetic scene embeddings .pt (optional; "
+                             "extracted automatically if missing)")
+    parser.add_argument("--model-id",     default="zai-org/CogVideoX-5b-I2V",
+                        help="CogVideoX model ID for synthetic embedding extraction")
+    parser.add_argument("--lora-dir",     default=None,
+                        help="LoRA adapter directory (optional, for extraction)")
     args = parser.parse_args()
 
-    # Resolve manifest path
     if args.blender_dir is None:
         parser.error("--blender-dir is required")
     bd = Path(args.blender_dir)
@@ -397,6 +547,9 @@ def main():
         epochs=args.epochs,
         lr=args.lr,
         batch_size=args.batch_size,
+        synthetic_embeddings_path=args.synthetic_embeddings,
+        model_id=args.model_id,
+        lora_dir=args.lora_dir,
     )
 
 

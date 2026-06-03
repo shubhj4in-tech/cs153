@@ -76,53 +76,39 @@ def train(
 
     # ── Load CogVideoX ────────────────────────────────────────────────────────
     print(f"[FineTune] Loading CogVideoX from {model_id} ...")
-    # We only need the transformer (no VAE/tokenizer needed for feature extraction)
     pipeline = CogVideoXPipeline.from_pretrained(
         model_id,
         torch_dtype=torch.bfloat16,
     )
+    vae         = pipeline.vae.to(device).eval()
     transformer = pipeline.transformer.to(device)
 
     # Freeze all base parameters
     for p in transformer.parameters():
         p.requires_grad_(False)
+    for p in vae.parameters():
+        p.requires_grad_(False)
 
-    # VERIFY: CogVideoX transformer block attribute names.
-    # In diffusers >=0.30, CogVideoXTransformer3DModel stores blocks in
-    # transformer.transformer_blocks[i] and attention in block.attn1 / block.attn2.
-    # The exact submodule names for LoRA targets may differ.
-    # Check: list(transformer.transformer_blocks[0].named_modules())
-
-    # ── Apply LoRA to target blocks ───────────────────────────────────────────
-    # Target blocks 12-18 (the "deep" temporal layers)
-    target_block_indices = list(range(12, min(19, len(transformer.transformer_blocks))))
+    # ── Apply LoRA to target blocks via layers_to_transform ───────────────────
+    # This applies LoRA only to transformer_blocks[12..18] without any
+    # ModuleList wrapper — save/load works correctly via PEFT.
+    n_blocks = len(transformer.transformer_blocks)
+    target_block_indices = list(range(12, min(19, n_blocks)))
     print(f"  Applying LoRA to blocks {target_block_indices[0]}–{target_block_indices[-1]}")
 
-    # VERIFY: target_modules names. CogVideoX may use "attn1.to_q" etc.
-    # Adjust if you see 'target_modules not found' errors from PEFT.
     lora_config = LoraConfig(
         r=lora_r,
         lora_alpha=lora_alpha,
         target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+        layers_to_transform=target_block_indices,
+        layers_pattern="transformer_blocks",
         lora_dropout=0.0,
         bias="none",
         task_type=TaskType.FEATURE_EXTRACTION,
     )
-
-    # Apply LoRA only to the selected blocks by temporarily isolating them
-    # We create a small wrapper module containing just the target blocks
-    selected_blocks = nn.ModuleList(
-        [transformer.transformer_blocks[i] for i in target_block_indices]
-    )
-    selected_blocks_lora = get_peft_model(selected_blocks, lora_config)
-
-    # Re-attach the LoRA'd blocks back into the transformer
-    for j, i in enumerate(target_block_indices):
-        transformer.transformer_blocks[i] = selected_blocks_lora.base_model.model[j]
+    transformer = get_peft_model(transformer, lora_config)
 
     # ── Flow prediction head ──────────────────────────────────────────────────
-    # CogVideoX hidden dimension
-    # VERIFY: hidden_size attribute name from model config
     hidden_size = getattr(transformer.config, "hidden_size", 3072)
 
     flow_head = nn.Sequential(
@@ -207,29 +193,21 @@ def train(
 
         B, T, C, H, W = rgb_clip.shape
 
-        # CogVideoX expects (B, C, T, H, W) for video input
-        # VERIFY: exact input format for CogVideoX transformer
-        # The transformer forward() signature takes hidden_states, not raw pixels.
-        # We need to encode through the VAE first, OR hook into the pipeline.
-        # For simplicity, we pass the pixel tensor through a small linear projection
-        # to approximate the VAE-encoded latent. In a full implementation, use the VAE.
-        # VERIFY: whether to use VAE encoding here for better quality features.
+        # Encode through VAE to get proper latents.
+        # VAE encodes (B*T, 3, H, W) → (B*T, latent_C, H//8, W//8).
+        with torch.no_grad():
+            frames_flat = rgb_clip.reshape(B * T, C, H, W)
+            latents_flat = vae.encode(frames_flat).latent_dist.sample()
+            latents_flat = latents_flat * vae.config.scaling_factor
+        latent_C = latents_flat.shape[1]
+        latent_H = latents_flat.shape[2]
+        latent_W = latents_flat.shape[3]
+        # Reshape to (B, latent_C, T, latent_H, latent_W) for the transformer
+        latent = latents_flat.reshape(B, T, latent_C, latent_H, latent_W)
+        latent = latent.permute(0, 2, 1, 3, 4)   # (B, latent_C, T, latent_H, latent_W)
 
-        # Simple pixel-to-latent approximation (4x spatial downscale)
-        latent = F.avg_pool3d(
-            rgb_clip.permute(0, 2, 1, 3, 4),   # (B, C, T, H, W)
-            kernel_size=(1, 4, 4),
-            stride=(1, 4, 4),
-        )   # (B, C, T, H//4, W//4)
-
-        # Run through transformer (only LoRA'd layers are computed)
-        # VERIFY: CogVideoXTransformer3DModel forward signature
-        # typical: transformer(hidden_states, encoder_hidden_states, timestep, ...)
-        # For feature extraction at inference, we can pass dummy timestep=0
         dummy_timestep = torch.zeros(B, dtype=torch.long, device=device)
 
-        # Flatten spatial for transformer input (B, T*seq, D) — approximate
-        # Since we are only interested in internal features via hooks, not the output
         extracted_features.clear()
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
             try:
@@ -242,11 +220,8 @@ def train(
                     return_dict=False,
                 )
             except Exception as e:
-                # VERIFY: If the transformer forward signature differs,
-                # adjust the call above. Run:
-                #   import inspect; print(inspect.signature(transformer.forward))
                 print(f"  Transformer forward failed: {e}")
-                print("  VERIFY: CogVideoX forward() signature in diffusers.")
+                print("  VERIFY: Run `import inspect; print(inspect.signature(transformer.forward))`")
                 raise
 
         # ── Aggregate features from hooked layers ─────────────────────────────
@@ -306,9 +281,7 @@ def train(
         if (global_step + 1) % save_every == 0:
             ckpt_dir = out / f"checkpoint-{global_step+1}"
             ckpt_dir.mkdir(parents=True, exist_ok=True)
-            # Save LoRA adapter weights
-            selected_blocks_lora.save_pretrained(str(ckpt_dir / "lora_adapter"))
-            # Save flow head
+            transformer.save_pretrained(str(ckpt_dir / "lora_adapter"))
             torch.save(flow_head.state_dict(), str(ckpt_dir / "flow_head.pt"))
             print(f"  Saved checkpoint → {ckpt_dir}")
 
@@ -320,7 +293,7 @@ def train(
 
     final_dir = out / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
-    selected_blocks_lora.save_pretrained(str(final_dir / "lora_adapter"))
+    transformer.save_pretrained(str(final_dir / "lora_adapter"))
     torch.save(flow_head.state_dict(), str(final_dir / "flow_head.pt"))
     print(f"\n[FineTune] Training done → {final_dir}")
 
