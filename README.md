@@ -21,7 +21,7 @@ A complete end-to-end pipeline that turns a 30-second phone video into a navigab
 ## Setup
 
 ```bash
-git clone <your-repo-url> 4drecon
+git clone https://github.com/shubhj4in-tech/cs153.git 4drecon
 cd 4drecon
 
 # Copy env template and fill in API keys
@@ -199,5 +199,52 @@ python eval/visualize.py \
   modal_config.py    Shared Modal app + volumes + container images
   requirements.txt   Pinned Python dependencies
 ```
+
+---
+
+## Citations & Acknowledgements
+
+This project builds on the following open-source work:
+
+| Component | Paper / Repo |
+|-----------|-------------|
+| **3D Gaussian Splatting** | Kerbl et al., "3D Gaussian Splatting for Real-Time Radiance Field Rendering", SIGGRAPH 2023. [Paper](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) · [Code](https://github.com/graphdeco-inria/gaussian-splatting) |
+| **Deformable-3DGS** | Yang et al., "Deformable 3D Gaussians for High-Fidelity Monocular Dynamic Scene Reconstruction", CVPR 2024. [Paper](https://arxiv.org/abs/2309.13101) · [Code](https://github.com/ingra14m/Deformable-3D-Gaussians) |
+| **CogVideoX-5b-I2V** | Yang et al., "CogVideoX: Text-to-Video Diffusion Models with An Expert Transformer", 2024. [Paper](https://arxiv.org/abs/2408.06072) · [Model](https://huggingface.co/zai-org/CogVideoX-5b-I2V) |
+| **Apple Depth Pro** | Bochkovskii et al., "Depth Pro: Sharp Monocular Metric Depth in Less Than a Second", 2024. [Paper](https://arxiv.org/abs/2410.02073) · [Code](https://github.com/apple/ml-depth-pro) |
+| **DUSt3R** | Wang et al., "DUSt3R: Geometric 3D Vision Made Easy", CVPR 2024. [Paper](https://arxiv.org/abs/2312.14132) · [Code](https://github.com/naver/dust3r) |
+| **SAM 2** | Ravi et al., "SAM 2: Segment Anything in Images and Videos", 2024. [Paper](https://arxiv.org/abs/2408.00714) · [Code](https://github.com/facebookresearch/sam2) |
+| **RAFT** | Teed & Deng, "RAFT: Recurrent All-Pairs Field Transforms for Optical Flow", ECCV 2020. [Paper](https://arxiv.org/abs/2003.12039) · [torchvision impl](https://pytorch.org/vision/stable/models/raft.html) |
+| **PEFT / LoRA** | Hu et al., "LoRA: Low-Rank Adaptation of Large Language Models", ICLR 2022. [Paper](https://arxiv.org/abs/2106.09685) · [Code](https://github.com/huggingface/peft) |
+| **GaussianSplats3D viewer** | [mkkellogg/GaussianSplats3D](https://github.com/mkkellogg/GaussianSplats3D) |
+| **Modal** | Cloud GPU infrastructure — [modal.com](https://modal.com) |
+
+---
+
+## AI Usage Disclosure
+
+Large language models (Claude Sonnet 4.5 / Claude Code) were used as coding assistants throughout this project in the following ways:
+
+- **Boilerplate generation**: initial scaffolding for pipeline stages, Modal function wrappers, and the dataset loader.
+- **Debugging**: identifying and resolving shape mismatches in the VAE/latent pipeline and COLMAP text-format writer.
+- **Code review**: checking correctness of the quaternion → rotation-matrix conversion, the `.splat` binary packing, and the RAFT optical-flow integration.
+- **Documentation**: drafting docstrings and the README structure.
+
+All AI-generated code was reviewed, tested, and often substantially modified by the authors. The core research idea (using CogVideoX temporal attention features to warm-initialise the Deformable-3DGS deformation MLP) is original work.
+
+---
+
+## External Resources & Links
+
+- **GitHub Repository**: <https://github.com/shubhj4in-tech/cs153>
+- **Modal (cloud GPU)**: <https://modal.com>
+- **Weights & Biases**: <https://wandb.ai>
+- **Hugging Face — CogVideoX-5b-I2V**: <https://huggingface.co/zai-org/CogVideoX-5b-I2V>
+- **3D Gaussian Splatting project page**: <https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/>
+- **Deformable-3D-Gaussians**: <https://github.com/ingra14m/Deformable-3D-Gaussians>
+- **Apple Depth Pro**: <https://github.com/apple/ml-depth-pro>
+- **DUSt3R**: <https://github.com/naver/dust3r>
+- **SAM 2**: <https://github.com/facebookresearch/sam2>
+- **antimatter15/splat** (`.splat` format spec): <https://github.com/antimatter15/splat>
 
 ---
