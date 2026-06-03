@@ -77,15 +77,16 @@ pipeline_image = (
         "git clone --depth 1 https://github.com/apple/ml-depth-pro /opt/ml-depth-pro",
         "pip install -e /opt/ml-depth-pro",
     )
-    # Clone DUSt3R and install (filter conflicting packages)
-    # - safetensors: DUSt3R would downgrade below diffusers' >=0.8.0 requirement
-    # - gradio/gradio-client: not needed for inference; pulls numpy>=2 which breaks depth-pro
+    # Clone DUSt3R — importable via PYTHONPATH (no setup.py, so no pip install -e)
+    # Filter packages that conflict with depth-pro / diffusers:
+    #   safetensors  → DUSt3R pins 0.7.x; diffusers needs >=0.8.0
+    #   gradio       → pulls numpy>=2; depth-pro needs numpy<2
+    #   tensorboard  → also pulls numpy>=2 + safetensors 0.7.x; not needed for inference
     .run_commands(
         "git clone --depth 1 https://github.com/naver/dust3r /opt/dust3r",
-        "grep -vE 'safetensors|gradio' /opt/dust3r/requirements.txt > /tmp/dust3r_req_filtered.txt || true",
+        "grep -vE 'safetensors|gradio|tensorboard' /opt/dust3r/requirements.txt > /tmp/dust3r_req_filtered.txt || true",
         "pip install -r /tmp/dust3r_req_filtered.txt",
-        "pip install -e /opt/dust3r",
-        # Re-pin versions that gradio's transitive deps may have clobbered
+        # Re-pin versions that transitive deps may have clobbered
         "pip install 'numpy<2' 'safetensors>=0.8.0'",
     )
     # Clone SAM2 and install
