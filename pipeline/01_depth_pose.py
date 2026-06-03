@@ -52,11 +52,28 @@ def run_depth_pro(frames_dir: Path, depth_dir: Path, model_dir: Path):
     depth_dir.mkdir(parents=True, exist_ok=True)
 
     import depth_pro
+    import dataclasses
+    import subprocess
+
+    # Resolve checkpoint — prefer Modal volume path, then download if absent
+    ckpt_path = model_dir / "depth_pro" / "depth_pro.pt"
+    if not ckpt_path.exists():
+        print(f"[Stage 1] depth_pro.pt not found at {ckpt_path} — downloading from HF ...")
+        ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run([
+            "huggingface-cli", "download", "apple/DepthPro",
+            "depth_pro.pt",
+            "--local-dir", str(ckpt_path.parent),
+        ], check=True)
+
+    from depth_pro.depth_pro import DEFAULT_MONODEPTH_CONFIG_DICT
+    config = dataclasses.replace(
+        DEFAULT_MONODEPTH_CONFIG_DICT, checkpoint_uri=str(ckpt_path)
+    )
 
     print("[Stage 1] Loading Depth-Pro ...")
-    # depth-pro pip package downloads checkpoint automatically to ~/.cache on first run
-    # Pass HF_TOKEN if needed for gated model
     model, transform = depth_pro.create_model_and_transforms(
+        config=config,
         device=torch.device("cuda"),
         precision=torch.half,
     )
