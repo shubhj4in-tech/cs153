@@ -206,7 +206,7 @@ def run_dust3r(frames_dir: Path, depth_dir: Path, out_dir: Path, model_dir: Path
         conf_hw = conf[i].detach().cpu().numpy()               # (H_d, W_d)
         h_d, w_d = conf_hw.shape
         pts = pts3d[i].detach().cpu().numpy().reshape(-1, 3)   # (H_d*W_d, 3)
-        conf_mask = conf_hw.flatten() > 1.5
+        conf_mask = conf_hw.flatten() > 1.0
         # Resize original image to DUSt3R's resolution for per-point colours
         img_d = cv2.resize(img, (w_d, h_d), interpolation=cv2.INTER_LINEAR)
         pts_filt  = pts[conf_mask]
