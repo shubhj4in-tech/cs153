@@ -201,8 +201,8 @@ def run_dust3r(frames_dir: Path, depth_dir: Path, out_dir: Path, model_dir: Path
         cameras.append(cam)
 
         # Collect dense points (subsample to keep ply manageable)
-        pts = pts3d[i].cpu().numpy()       # (H*W, 3)
-        conf_mask = conf[i].cpu().numpy().flatten() > 1.5
+        pts = pts3d[i].detach().cpu().numpy()       # (H*W, 3)
+        conf_mask = conf[i].detach().cpu().numpy().flatten() > 1.5
         pts_filt  = pts[conf_mask]
         col_filt  = img.reshape(-1, 3)[conf_mask]
 
