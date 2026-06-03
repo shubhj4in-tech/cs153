@@ -78,16 +78,19 @@ pipeline_image = (
         "pip install -e /opt/ml-depth-pro",
     )
     # Clone DUSt3R — importable via PYTHONPATH (no setup.py, so no pip install -e)
-    # Filter packages that conflict with depth-pro / diffusers:
-    #   safetensors  → DUSt3R pins 0.7.x; diffusers needs >=0.8.0
+    # Filter packages not needed for inference that create conflicts:
+    #   safetensors  → DUSt3R pins 0.7.x; diffusers needs >=0.8.0rc0
     #   gradio       → pulls numpy>=2; depth-pro needs numpy<2
-    #   tensorboard  → also pulls numpy>=2 + safetensors 0.7.x; not needed for inference
+    #   tensorboard  → pulls numpy>=2 + safetensors 0.7.x
+    #   trimesh      → pulls numpy>=2 (transitive); only used for DUSt3R visualisation
+    #   pyglet       → visualisation only; not needed for inference
+    # Pass numpy/safetensors pins in the SAME pip call so the solver sees all
+    # constraints at once and won't upgrade numpy or downgrade safetensors.
     .run_commands(
         "git clone --depth 1 https://github.com/naver/dust3r /opt/dust3r",
-        "grep -vE 'safetensors|gradio|tensorboard' /opt/dust3r/requirements.txt > /tmp/dust3r_req_filtered.txt || true",
-        "pip install -r /tmp/dust3r_req_filtered.txt",
-        # Re-pin versions that transitive deps may have clobbered
-        "pip install 'numpy<2' 'safetensors>=0.8.0'",
+        "grep -vE 'safetensors|gradio|tensorboard|trimesh|pyglet' /opt/dust3r/requirements.txt "
+        "> /tmp/dust3r_req_filtered.txt || true",
+        "pip install -r /tmp/dust3r_req_filtered.txt 'numpy<2' 'safetensors>=0.8.0rc0,<1.0'",
     )
     # Clone SAM2 and install
     .run_commands(
