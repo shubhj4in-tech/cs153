@@ -120,6 +120,7 @@ def run_dust3r(frames_dir: Path, depth_dir: Path, out_dir: Path, model_dir: Path
         out_dir/cameras.json       — COLMAP-like cameras + extrinsics
         out_dir/pointcloud.ply     — sparse point cloud from depth unprojection
     """
+    import cv2
     import numpy as np
     import torch
     from plyfile import PlyData, PlyElement
