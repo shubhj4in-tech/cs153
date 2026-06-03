@@ -33,130 +33,147 @@ def find_frame0(scene_dir: Path):
 
 # ─── Tiny HTTP server ─────────────────────────────────────────────────────────
 
-_scene_dir  = None
-_frame_path = None
-_saved      = threading.Event()
+_scene_dir   = None
+_frame_paths = None   # list of all frame paths
+_saved       = threading.Event()
 
-HTML = """<!DOCTYPE html>
+HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <title>SAM2 Seed Picker</title>
 <style>
-  body { margin: 0; background: #111; color: #eee; font-family: sans-serif;
-         display: flex; flex-direction: column; align-items: center; padding: 20px; }
-  h2   { margin-bottom: 6px; }
-  p    { margin: 4px 0 12px; font-size: 13px; color: #aaa; }
-  #wrap { position: relative; cursor: crosshair; display: inline-block; }
-  #frame { max-width: 95vw; display: block; }
-  canvas { position: absolute; top: 0; left: 0; pointer-events: none; }
-  #controls { margin-top: 14px; display: flex; gap: 12px; align-items: center; }
-  button { padding: 10px 22px; font-size: 15px; border: none; border-radius: 6px;
-           cursor: pointer; }
-  #saveBtn  { background: #22c55e; color: #fff; }
-  #clearBtn { background: #6b7280; color: #fff; }
-  #modeBtn  { background: #3b82f6; color: #fff; min-width: 160px; }
-  #status { font-size: 13px; color: #4ade80; min-width: 200px; text-align: center; }
+  body {{ margin: 0; background: #111; color: #eee; font-family: sans-serif;
+         display: flex; flex-direction: column; align-items: center; padding: 20px; }}
+  h2   {{ margin-bottom: 4px; }}
+  p    {{ margin: 4px 0 10px; font-size: 13px; color: #aaa; }}
+  #scrubber {{ display: flex; align-items: center; gap: 10px; margin-bottom: 10px; width: 95vw; max-width: 960px; }}
+  #scrubber input {{ flex: 1; }}
+  #frameLabel {{ font-size: 13px; color: #facc15; min-width: 100px; }}
+  #wrap {{ position: relative; cursor: crosshair; display: inline-block; }}
+  #frameImg {{ max-width: 95vw; display: block; }}
+  canvas {{ position: absolute; top: 0; left: 0; pointer-events: none; }}
+  #controls {{ margin-top: 12px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: center; }}
+  button {{ padding: 9px 20px; font-size: 14px; border: none; border-radius: 6px; cursor: pointer; }}
+  #saveBtn  {{ background: #22c55e; color: #fff; }}
+  #clearBtn {{ background: #6b7280; color: #fff; }}
+  #modeBtn  {{ background: #3b82f6; color: #fff; min-width: 170px; }}
+  #status {{ font-size: 13px; color: #4ade80; min-width: 220px; text-align: center; }}
 </style>
 </head>
 <body>
-<h2>SAM2 Seed Picker — Frame 0</h2>
+<h2>SAM2 Seed Picker</h2>
 <p>
-  <b>Left-click</b> = foreground (green dot) &nbsp;|&nbsp;
-  <b>Right-click</b> = background (red dot) &nbsp;|&nbsp;
-  Mode button toggles which click adds which label.
+  Scrub to find a frame where <b>you are visible</b>. Then
+  <b>left-click</b> your body (green = foreground).
+  Right-click to mark background. Hit <b>Save &amp; Continue</b> when done.
 </p>
+<div id="scrubber">
+  <span style="font-size:13px">Frame:</span>
+  <input type="range" id="slider" min="0" max="{n_frames_minus_1}" value="0" oninput="changeFrame(this.value)">
+  <span id="frameLabel">1 / {n_frames}</span>
+</div>
 <div id="wrap">
-  <img id="frame" src="/frame" draggable="false">
+  <img id="frameImg" src="/frame/0" draggable="false">
   <canvas id="canvas"></canvas>
 </div>
 <div id="controls">
   <button id="modeBtn" onclick="toggleMode()">Mode: FG (left-click)</button>
-  <button id="clearBtn" onclick="clearPoints()">Clear All</button>
+  <button id="clearBtn" onclick="clearPoints()">Clear Points</button>
   <button id="saveBtn" onclick="save()">Save &amp; Continue ▶</button>
   <span id="status"></span>
 </div>
 <script>
-const img    = document.getElementById('frame');
+const img    = document.getElementById('frameImg');
 const canvas = document.getElementById('canvas');
 const ctx    = canvas.getContext('2d');
 const status = document.getElementById('status');
-let points   = [];
-let fgOnLeft = true;   // if false, left=bg, right=fg
+const nFrames = {n_frames};
+let points     = [];
+let frameIdx   = 0;
+let fgOnLeft   = true;
 
-function toggleMode() {
+function toggleMode() {{
   fgOnLeft = !fgOnLeft;
   document.getElementById('modeBtn').textContent =
     fgOnLeft ? 'Mode: FG (left-click)' : 'Mode: BG (left-click)';
-}
+}}
 
-img.onload = () => {
+function changeFrame(v) {{
+  frameIdx = parseInt(v);
+  document.getElementById('frameLabel').textContent = (frameIdx + 1) + ' / ' + nFrames;
+  img.src = '/frame/' + frameIdx + '?t=' + Date.now();
+  clearPoints();
+}}
+
+img.onload = () => {{
   canvas.width  = img.naturalWidth;
   canvas.height = img.naturalHeight;
   canvas.style.width  = img.offsetWidth  + 'px';
   canvas.style.height = img.offsetHeight + 'px';
   redraw();
-};
+}};
 
-window.addEventListener('resize', () => {
+window.addEventListener('resize', () => {{
   canvas.style.width  = img.offsetWidth  + 'px';
   canvas.style.height = img.offsetHeight + 'px';
-});
+}});
 
-document.getElementById('wrap').addEventListener('click', (e) => {
+document.getElementById('wrap').addEventListener('click', (e) => {{
   addPoint(e, fgOnLeft ? 1 : 0);
-});
-document.getElementById('wrap').addEventListener('contextmenu', (e) => {
+}});
+document.getElementById('wrap').addEventListener('contextmenu', (e) => {{
   e.preventDefault();
   addPoint(e, fgOnLeft ? 0 : 1);
-});
+}});
 
-function addPoint(e, label) {
+function addPoint(e, label) {{
   const rect = img.getBoundingClientRect();
   const scaleX = img.naturalWidth  / img.offsetWidth;
   const scaleY = img.naturalHeight / img.offsetHeight;
   const x = Math.round((e.clientX - rect.left) * scaleX);
   const y = Math.round((e.clientY - rect.top)  * scaleY);
-  points.push({ x, y, label });
+  points.push({{ x, y, label }});
   redraw();
-  status.textContent = `${points.length} point(s) placed`;
-}
+  const nFg = points.filter(p => p.label===1).length;
+  status.textContent = nFg + ' FG point(s) placed';
+}}
 
-function redraw() {
+function redraw() {{
   ctx.clearRect(0, 0, canvas.width, canvas.height);
-  for (const p of points) {
+  for (const p of points) {{
     ctx.beginPath();
-    ctx.arc(p.x, p.y, 8, 0, Math.PI * 2);
+    ctx.arc(p.x, p.y, 9, 0, Math.PI * 2);
     ctx.fillStyle   = p.label === 1 ? 'rgba(34,197,94,0.85)' : 'rgba(239,68,68,0.85)';
     ctx.strokeStyle = '#fff';
-    ctx.lineWidth   = 2;
+    ctx.lineWidth   = 2.5;
     ctx.fill();
     ctx.stroke();
-  }
-}
+  }}
+}}
 
-function clearPoints() {
+function clearPoints() {{
   points = [];
   redraw();
-  status.textContent = 'Cleared';
-}
+  status.textContent = '';
+}}
 
-async function save() {
-  if (points.length === 0) {
-    alert('Please click at least one foreground point first.');
+async function save() {{
+  if (points.filter(p => p.label===1).length === 0) {{
+    alert('Please place at least one foreground (green) point on yourself first.');
     return;
-  }
+  }}
   status.textContent = 'Saving…';
-  const res = await fetch('/save', {
+  const res = await fetch('/save', {{
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ points }),
-  });
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify({{ frame_index: frameIdx, points }}),
+  }});
   const msg = await res.text();
   status.textContent = msg;
   document.getElementById('saveBtn').disabled = true;
   document.getElementById('saveBtn').textContent = '✓ Saved!';
-}
+}}
 </script>
 </body>
 </html>
@@ -168,16 +185,24 @@ class Handler(BaseHTTPRequestHandler):
         pass   # silence request logs
 
     def do_GET(self):
-        if self.path == "/":
+        path = self.path.split("?")[0]
+
+        if path == "/":
+            n = len(_frame_paths)
+            html = HTML_TEMPLATE.format(n_frames=n, n_frames_minus_1=n - 1)
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
-            self.wfile.write(HTML.encode())
+            self.wfile.write(html.encode())
 
-        elif self.path == "/frame":
-            data = _frame_path.read_bytes()
-            ext  = _frame_path.suffix.lstrip(".")
-            mime = "image/jpeg" if ext in ("jpg", "jpeg") else "image/png"
+        elif path.startswith("/frame/"):
+            try:
+                idx = int(path.split("/frame/")[1])
+                fp  = _frame_paths[idx]
+            except (ValueError, IndexError):
+                self.send_response(404); self.end_headers(); return
+            data = fp.read_bytes()
+            mime = "image/jpeg" if fp.suffix in (".jpg", ".jpeg") else "image/png"
             self.send_response(200)
             self.send_header("Content-Type", mime)
             self.send_header("Content-Length", str(len(data)))
@@ -192,9 +217,10 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             body   = json.loads(self.rfile.read(length))
 
+            idx  = body.get("frame_index", 0)
             spec = {
-                "frame_index": 0,
-                "frame_name":  _frame_path.name,
+                "frame_index": idx,
+                "frame_name":  _frame_paths[idx].name,
                 "points":      body["points"],
             }
             out = _scene_dir / "mask_frame0.json"
@@ -216,17 +242,20 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    global _scene_dir, _frame_path
+    global _scene_dir, _frame_paths
 
     parser = argparse.ArgumentParser(description="Browser-based SAM2 seed picker")
     parser.add_argument("--scene-dir", required=True)
     parser.add_argument("--port", type=int, default=7860)
     args = parser.parse_args()
 
-    _scene_dir  = Path(args.scene_dir).resolve()
-    _frame_path = find_frame0(_scene_dir)
+    _scene_dir   = Path(args.scene_dir).resolve()
+    frames_dir   = _scene_dir / "frames"
+    _frame_paths = sorted(frames_dir.glob("*.png")) or sorted(frames_dir.glob("*.jpg"))
+    if not _frame_paths:
+        sys.exit(f"No frames found in {frames_dir}")
 
-    print(f"[seed_ui] Frame 0: {_frame_path.name}")
+    print(f"[seed_ui] {len(_frame_paths)} frames found in {frames_dir}")
     print(f"[seed_ui] Opening http://localhost:{args.port}")
     print(f"[seed_ui] Left-click = foreground (green), Right-click = background (red)")
     print(f"[seed_ui] Click 'Save & Continue' when done.\n")

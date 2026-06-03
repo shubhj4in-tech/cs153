@@ -99,52 +99,80 @@ pipeline_image = (
     .add_local_python_source("modal_config")
 )
 
-# ── Training image (A100 tasks: 3DGS, Deformable-3DGS, CogVideoX) ────────────
+# ── Shared pip packages for training images ───────────────────────────────────
+_training_pip = [
+    "diffusers>=0.30.0",
+    "transformers>=4.40.0",
+    "peft>=0.11.0",
+    "accelerate>=0.30.0",
+    "safetensors>=0.4.3",
+    "bitsandbytes>=0.43.0",
+    "wandb>=0.17.0",
+    "opencv-python>=4.9.0",
+    "imageio>=2.34.0",
+    "imageio-ffmpeg>=0.5.0",
+    "Pillow>=10.3.0",
+    "plyfile>=1.0.3",
+    "numpy>=1.26.0",
+    "scipy>=1.13.0",
+    "einops>=0.7.0",
+    "omegaconf>=2.3.0",
+    "tqdm>=4.66.0",
+    "rich>=13.7.0",
+    "lpips>=0.1.4",
+    "scikit-image>=0.22.0",
+]
+
+# ── Training image BG (A100: standard 3DGS background) ───────────────────────
+# Uses gaussian-splatting's own pinned diff-gaussian-rasterization submodule.
+# This version has `antialiasing` support and is verified to work for BG 3DGS.
 training_image = (
     _base
-    .pip_install([
-        "diffusers>=0.30.0",
-        "transformers>=4.40.0",
-        "peft>=0.11.0",
-        "accelerate>=0.30.0",
-        "safetensors>=0.4.3",
-        "bitsandbytes>=0.43.0",
-        "wandb>=0.17.0",
-        "opencv-python>=4.9.0",
-        "imageio>=2.34.0",
-        "imageio-ffmpeg>=0.5.0",
-        "Pillow>=10.3.0",
-        "plyfile>=1.0.3",
-        "numpy>=1.26.0",
-        "scipy>=1.13.0",
-        "einops>=0.7.0",
-        "omegaconf>=2.3.0",
-        "tqdm>=4.66.0",
-        "rich>=13.7.0",
-        "lpips>=0.1.4",
-        "scikit-image>=0.22.0",
-    ])
-    # Clone gaussian-splatting and build CUDA extensions
+    .apt_install(["clang"])   # required by diff-gaussian-rasterization build system
+    .pip_install(_training_pip)
     .run_commands(
+        "pip install wheel setuptools",
         "git clone --recursive --depth 1 "
         "https://github.com/graphdeco-inria/gaussian-splatting /opt/gaussian-splatting",
-        "pip install -e /opt/gaussian-splatting/submodules/diff-gaussian-rasterization",
-        "pip install -e /opt/gaussian-splatting/submodules/simple-knn",
-    )
-    # Clone Deformable-3D-Gaussians
-    .run_commands(
-        "git clone --depth 1 "
-        "https://github.com/ingra14m/Deformable-3D-Gaussians /opt/deformable-3dgs",
-        "pip install -r /opt/deformable-3dgs/requirements.txt || true",
+        "TORCH_CUDA_ARCH_LIST='8.0 8.6+PTX' MAX_JOBS=4 "
+        "pip install --no-build-isolation -e "
+        "/opt/gaussian-splatting/submodules/diff-gaussian-rasterization",
+        "TORCH_CUDA_ARCH_LIST='8.0 8.6+PTX' MAX_JOBS=4 "
+        "pip install --no-build-isolation -e "
+        "/opt/gaussian-splatting/submodules/simple-knn",
     )
     .env({
-        "PYTHONPATH": (
-            "/opt/gaussian-splatting:"
-            "/opt/deformable-3dgs:"
-            "$PYTHONPATH"
-        )
+        "PYTHONPATH": "/opt/gaussian-splatting:$PYTHONPATH",
+        "TORCH_CUDA_ARCH_LIST": "8.0 8.6+PTX",
     })
-    # Make modal_config importable in the container
+    .add_local_python_source("modal_config")
+)
+
+# ── Training image FG (A100: Deformable-3DGS foreground) ─────────────────────
+# Deformable-3DGS ships its own `depth-diff-gaussian-rasterization` fork which
+# adds depth rendering and the `means2D_densify` API used by its renderer.
+# The standard diff-gaussian-rasterization does NOT have means2D_densify, so
+# we must use Deformable-3DGS's own submodule here.
+training_image_fg = (
+    _base
+    .apt_install(["clang"])
+    .pip_install(_training_pip)
+    .run_commands(
+        "pip install wheel setuptools",
+        # Clone with submodules to get depth-diff-gaussian-rasterization + simple-knn
+        "git clone --depth 1 --recurse-submodules --shallow-submodules "
+        "https://github.com/ingra14m/Deformable-3D-Gaussians /opt/deformable-3dgs",
+        "TORCH_CUDA_ARCH_LIST='8.0 8.6+PTX' MAX_JOBS=4 "
+        "pip install --no-build-isolation -e "
+        "/opt/deformable-3dgs/submodules/depth-diff-gaussian-rasterization",
+        "TORCH_CUDA_ARCH_LIST='8.0 8.6+PTX' MAX_JOBS=4 "
+        "pip install --no-build-isolation -e "
+        "/opt/deformable-3dgs/submodules/simple-knn",
+    )
+    .env({
+        "PYTHONPATH": "/opt/deformable-3dgs:$PYTHONPATH",
+        "TORCH_CUDA_ARCH_LIST": "8.0 8.6+PTX",
+    })
     .add_local_python_source("modal_config")
 )
 

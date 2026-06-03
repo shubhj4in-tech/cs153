@@ -42,7 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import modal
-from modal_config import app, training_image, VOLUME_MAP, DATA_PATH, data_volume
+from modal_config import app, training_image, training_image_fg, VOLUME_MAP, DATA_PATH, data_volume
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -50,7 +50,8 @@ from modal_config import app, training_image, VOLUME_MAP, DATA_PATH, data_volume
 # ─────────────────────────────────────────────────────────────────────────────
 
 def prepare_colmap_structure(scene_dir: Path, frames_subdir: str,
-                              output_colmap_dir: Path):
+                              output_colmap_dir: Path,
+                              integer_names: bool = False):
     """
     The official gaussian-splatting train.py expects one of:
       - A COLMAP database + sparse/0/{cameras,images,points3D}.{bin|txt}
@@ -68,6 +69,17 @@ def prepare_colmap_structure(scene_dir: Path, frames_subdir: str,
     cams = json.loads(cameras_json.read_text())
     sparse_dir = output_colmap_dir / "sparse" / "0"
     sparse_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Build name map (original → colmap name) ──────────────────────────────
+    # Deformable-3DGS parses image filename stem as an integer for the temporal
+    # coordinate: fid = int(stem) / (N-1).  So when integer_names=True we
+    # rename frame_000001.png → 0.png, frame_000002.png → 1.png, etc.
+    src_frames = scene_dir / frames_subdir
+    frame_files = sorted(src_frames.glob("*.png"))
+    # Build original-name → new-name mapping
+    name_map: dict[str, str] = {}
+    for i, fp in enumerate(frame_files):
+        name_map[fp.name] = f"{i}.png" if integer_names else fp.name
 
     # ── cameras.txt ──────────────────────────────────────────────────────────
     # Format: camera_id  PINHOLE  width height fx fy cx cy
@@ -94,39 +106,70 @@ def prepare_colmap_structure(scene_dir: Path, frames_subdir: str,
             t   = w2c[:3, 3]
             # Convert rotation matrix to quaternion (w, x, y, z)
             q = rotation_matrix_to_quaternion(R)
+            img_name = name_map.get(cam["name"], cam["name"])
             f.write(
                 f"{cam['id']+1} "
                 f"{q[0]:.8f} {q[1]:.8f} {q[2]:.8f} {q[3]:.8f} "
                 f"{t[0]:.8f} {t[1]:.8f} {t[2]:.8f} "
-                f"1 {cam['name']}\n"
+                f"1 {img_name}\n"
             )
             f.write("\n")   # empty points line
 
-    # ── points3D.txt ─────────────────────────────────────────────────────────
-    ply_src = scene_dir / "pointcloud.ply"
-    if ply_src.exists():
-        import plyfile
-        ply = plyfile.PlyData.read(str(ply_src))
-        verts = ply["vertex"]
-        with open(sparse_dir / "points3D.txt", "w") as f:
-            f.write("# 3D point list with one line of data per point:\n")
-            f.write("#   POINT3D_ID  X  Y  Z  R  G  B  ERROR  TRACK[]\n")
-            for i, v in enumerate(verts):
-                f.write(
-                    f"{i+1} {float(v['x']):.6f} {float(v['y']):.6f} {float(v['z']):.6f} "
-                    f"{int(v['red'])} {int(v['green'])} {int(v['blue'])} 1.0\n"
-                )
-    else:
-        (sparse_dir / "points3D.txt").write_text(
-            "# 3D point list — empty (no pointcloud.ply found)\n"
-        )
+    # ── points3D.txt + points3D.ply ──────────────────────────────────────────
+    # 3DGS caches a points3D.ply next to points3D.txt and prefers it on
+    # subsequent runs.  We write BOTH files so a stale zero-point PLY from a
+    # previous failed run does not shadow our initialisation points.
+    import plyfile as _plyfile
 
-    # Symlink / copy images
+    ply_src = scene_dir / "pointcloud.ply"
+    xyzs, rgbs = [], []
+
+    if ply_src.exists():
+        ply = _plyfile.PlyData.read(str(ply_src))
+        verts = ply["vertex"]
+        for v in verts:
+            xyzs.append([float(v["x"]), float(v["y"]), float(v["z"])])
+            rgbs.append([int(v["red"]), int(v["green"]), int(v["blue"])])
+
+    if len(xyzs) == 0:
+        # Seed with random cloud so 3DGS does not crash on empty PCD
+        rng = np.random.default_rng(42)
+        rand_pts = rng.uniform(-1.0, 1.0, size=(1000, 3))
+        rand_rgb = rng.integers(100, 200, size=(1000, 3))
+        xyzs = rand_pts.tolist()
+        rgbs = rand_rgb.tolist()
+        print(f"[prepare_colmap] PLY had 0 points — seeded 1000 random points")
+
+    xyz_arr = np.array(xyzs, dtype=np.float32)
+    rgb_arr = np.array(rgbs, dtype=np.uint8)
+
+    # Write points3D.txt (COLMAP text format)
+    with open(sparse_dir / "points3D.txt", "w") as f:
+        f.write("# 3D point list with one line of data per point:\n")
+        f.write("#   POINT3D_ID  X  Y  Z  R  G  B  ERROR  TRACK[]\n")
+        for i, (xyz, rgb) in enumerate(zip(xyzs, rgbs)):
+            f.write(f"{i+1} {xyz[0]:.6f} {xyz[1]:.6f} {xyz[2]:.6f} "
+                    f"{rgb[0]} {rgb[1]} {rgb[2]} 1.0\n")
+
+    # Write points3D.ply (same format 3DGS's storePly produces) so 3DGS uses
+    # these points even if a stale zero-point PLY already exists in the dir.
+    dtype = [("x","f4"),("y","f4"),("z","f4"),
+             ("nx","f4"),("ny","f4"),("nz","f4"),
+             ("red","u1"),("green","u1"),("blue","u1")]
+    normals = np.zeros((len(xyzs), 3), dtype=np.float32)
+    attrs = np.concatenate([xyz_arr, normals, rgb_arr.astype(np.float32)], axis=1)
+    elems = np.empty(len(xyzs), dtype=dtype)
+    elems[:] = [tuple(row) for row in attrs]
+    _plyfile.PlyData([_plyfile.PlyElement.describe(elems, "vertex")]).write(
+        str(sparse_dir / "points3D.ply")
+    )
+    print(f"[prepare_colmap] Wrote {len(xyzs)} points to points3D.{{txt,ply}}")
+
+    # Symlink / copy images (using mapped names)
     images_dir = output_colmap_dir / "images"
     images_dir.mkdir(exist_ok=True)
-    src_frames = scene_dir / frames_subdir
-    for fp in sorted(src_frames.glob("*.png")):
-        dst = images_dir / fp.name
+    for fp in frame_files:
+        dst = images_dir / name_map[fp.name]
         if not dst.exists():
             os.symlink(str(fp.resolve()), str(dst))
 
@@ -270,7 +313,7 @@ def _do_reconstruct_foreground(scene_dir: Path, warm_init_path: str | None,
     import wandb
 
     colmap_dir = scene_dir / "_colmap_fg"
-    prepare_colmap_structure(scene_dir, "fg_frames", colmap_dir)
+    prepare_colmap_structure(scene_dir, "fg_frames", colmap_dir, integer_names=True)
 
     output_dir = scene_dir / "outputs" / "fg_gaussians"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -290,7 +333,11 @@ def _do_reconstruct_foreground(scene_dir: Path, warm_init_path: str | None,
         "-m", str(output_dir),
         "--iterations",    str(iterations),
         "--densify_until_iter", str(min(iterations // 2, 15000)),
-        "--mask_dir",      str(scene_dir / "fg_masks"),
+        # Skip intermediate test evaluation — it tries to cat images from all
+        # test cameras which can have a size mismatch with depth-diff-g-r.
+        # Setting test_iterations beyond total iterations disables it entirely.
+        "--test_iterations", str(iterations + 1),
+        "--save_iterations", str(iterations),
     ]
 
     if warm_init_path:
@@ -335,9 +382,6 @@ def _do_reconstruct_foreground(scene_dir: Path, warm_init_path: str | None,
     volumes=VOLUME_MAP,
     timeout=7200,
     memory=40960,
-    secrets=[
-        modal.Secret.from_name("wandb-secret", required=False),
-    ],
 )
 def reconstruct_background(scene_dir_relative: str):
     """
@@ -350,14 +394,11 @@ def reconstruct_background(scene_dir_relative: str):
 
 
 @app.function(
-    image=training_image,
+    image=training_image_fg,
     gpu="A100",
     volumes=VOLUME_MAP,
     timeout=7200,
     memory=40960,
-    secrets=[
-        modal.Secret.from_name("wandb-secret", required=False),
-    ],
 )
 def reconstruct_foreground(scene_dir_relative: str,
                             warm_init_path: str | None = None,
@@ -406,14 +447,39 @@ def main():
         print(f"[Stage 3] Launching Modal jobs for scene '{scene_name}' ...")
         with modal.enable_output():
             with app.run():
+                handles = []
                 if args.mode in ("bg", "both"):
-                    reconstruct_background.remote(scene_name)
+                    handles.append(("bg", reconstruct_background.spawn(scene_name)))
                 if args.mode in ("fg", "both"):
-                    reconstruct_foreground.remote(
-                        scene_name,
-                        args.warm_init,
-                        args.fg_iterations,
-                    )
+                    handles.append(("fg", reconstruct_foreground.spawn(
+                        scene_name, args.warm_init, args.fg_iterations)))
+                for label, h in handles:
+                    print(f"[Stage 3] Waiting for {label} reconstruction ...")
+                    h.get()
+                    print(f"[Stage 3] {label} reconstruction done.")
+
+        # Download outputs from Modal volume
+        print("[Stage 3] Downloading reconstruction outputs ...")
+        for out_subdir in ("outputs/bg_gaussians", "outputs/fg_gaussians"):
+            if args.mode == "bg" and "fg" in out_subdir:
+                continue
+            if args.mode == "fg" and "bg" in out_subdir:
+                continue
+            local_out = sd / out_subdir
+            local_out.parent.mkdir(parents=True, exist_ok=True)
+            remote_path = f"{scene_name}/{out_subdir}"
+            print(f"  Downloading {remote_path} → {local_out} ...")
+            # modal volume get downloads a folder recursively to local_out
+            result = subprocess.run(
+                [sys.executable, "-m", "modal", "volume", "get",
+                 "--force", "4drecon-data", remote_path, str(local_out)],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                print(f"  WARNING: download failed: {result.stderr.strip()}")
+            else:
+                print(f"  Downloaded {out_subdir} OK")
+        print("[Stage 3] Download done.")
 
     print("[Stage 3] DONE")
 

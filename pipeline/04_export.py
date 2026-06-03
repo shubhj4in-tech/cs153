@@ -159,15 +159,19 @@ def load_deformable_gaussians(fg_ckpt_dir: Path, timestamp: float) -> dict:
     Load the Deformable-3DGS checkpoint and apply the deformation MLP at
     normalised time t ∈ [0, 1].
 
-    The deformation MLP takes (x, y, z, t) and outputs Δ(xyz, rot, scale).
+    Checkpoint layout (ingra14m/Deformable-3D-Gaussians):
+      fg_base/point_cloud/iteration_N/point_cloud.ply   — canonical Gaussians
+      fg_base/deform/iteration_N/deform.pth             — DeformNetwork weights
 
-    VERIFY: The exact checkpoint filename convention used by Deformable-3DGS.
-    Typically: fg_ckpt_dir/point_cloud.ply  (canonical positions)
-               fg_ckpt_dir/deformation/deformation.pth  (MLP weights)
-    Check the Deformable-3D-Gaussians repo structure if paths differ.
+    DeformNetwork.forward(x, t) → (d_xyz, d_rotation, d_scaling)
+    All outputs are DELTAS added to the canonical values.
     """
     ply_path = fg_ckpt_dir / "point_cloud.ply"
-    mlp_path = fg_ckpt_dir / "deformation" / "deformation.pth"
+
+    # Derive paths: fg_ckpt_dir = fg_base/point_cloud/iteration_N/
+    iteration = int(fg_ckpt_dir.name.split("_")[-1])
+    fg_base   = fg_ckpt_dir.parent.parent
+    mlp_path  = fg_base / "deform" / f"iteration_{iteration}" / "deform.pth"
 
     if not ply_path.exists():
         raise FileNotFoundError(f"FG point cloud not found: {ply_path}")
@@ -180,55 +184,37 @@ def load_deformable_gaussians(fg_ckpt_dir: Path, timestamp: float) -> dict:
               "Using canonical positions (no motion).")
         return gauss
 
-    # ── Load MLP ──────────────────────────────────────────────────────────────
-    # Deformable-3D-Gaussians (ingra14m) uses DeformNetwork in scene/deformation.py.
-    # We try multiple names for forward-compatibility.
+    # ── Load DeformNetwork ─────────────────────────────────────────────────────
+    # Try both container path (/opt/deformable-3dgs) and local clone (/tmp/deformable-3dgs)
     try:
-        sys.path.insert(0, "/opt/deformable-3dgs")
-        deform_cls = None
-        for mod_path, cls_name in [
-            ("scene.deformation", "DeformNetwork"),
-            ("scene.deformation", "DeformationNetwork"),
-            ("utils.deform_model", "DeformModel"),
-        ]:
-            try:
-                mod = __import__(mod_path, fromlist=[cls_name])
-                deform_cls = getattr(mod, cls_name)
-                break
-            except (ImportError, AttributeError):
-                continue
+        for dgs_path in ["/opt/deformable-3dgs", "/tmp/deformable-3dgs"]:
+            if dgs_path not in sys.path:
+                sys.path.insert(0, dgs_path)
 
-        if deform_cls is None:
-            raise ImportError("Could not find deformation MLP class in Deformable-3DGS")
-
+        from utils.time_utils import DeformNetwork
         mlp_state = torch.load(str(mlp_path), map_location="cpu")
-        mlp = deform_cls()
+        mlp = DeformNetwork(is_blender=False, is_6dof=False)
         mlp.load_state_dict(mlp_state, strict=False)
         mlp.eval()
-    except (ImportError, Exception) as e:
+        print(f"  Loaded DeformNetwork from {mlp_path}")
+    except Exception as e:
         print(f"  WARNING: Could not load deformation MLP ({e}). "
               "Using canonical positions.")
         return gauss
 
     # ── Apply deformation ────────────────────────────────────────────────────
+    # DeformNetwork.forward(x, t) → (d_xyz, d_rotation, d_scaling)
     t_tensor = torch.full((N, 1), fill_value=timestamp, dtype=torch.float32)
     pos_t    = torch.from_numpy(gauss["positions"])    # (N, 3)
     rot_t    = torch.from_numpy(gauss["rotations"])    # (N, 4)
     sc_t     = torch.from_numpy(gauss["scales"])       # (N, 3)
 
     with torch.no_grad():
-        delta = mlp(pos_t, t_tensor)
+        d_xyz, d_rot, d_sc = mlp(pos_t, t_tensor)
 
-    if isinstance(delta, (tuple, list)) and len(delta) >= 3:
-        d_pos, d_rot, d_sc = delta[0], delta[1], delta[2]
-        gauss["positions"] = (pos_t + d_pos).numpy().astype(np.float32)
-        gauss["rotations"] = (rot_t + d_rot).numpy().astype(np.float32)
-        gauss["scales"]    = (sc_t  + d_sc).numpy().astype(np.float32)
-    elif isinstance(delta, (tuple, list)):
-        d_pos = delta[0]
-        gauss["positions"] = (pos_t + d_pos).numpy().astype(np.float32)
-    else:
-        gauss["positions"] = (pos_t + delta).numpy().astype(np.float32)
+    gauss["positions"] = (pos_t + d_xyz).numpy().astype(np.float32)
+    gauss["rotations"] = (rot_t + d_rot).numpy().astype(np.float32)
+    gauss["scales"]    = (sc_t  + d_sc ).numpy().astype(np.float32)
 
     return gauss
 

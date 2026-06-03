@@ -29,6 +29,7 @@ Approximate GPU cost: ~0.20 A10G-hours for a 30-second scene at 2fps.
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -128,25 +129,47 @@ def propagate_masks(frames_dir: Path, mask_spec: dict, fg_masks_dir: Path,
     from sam2.build_sam import build_sam2_video_predictor
 
     ckpt_candidates = [
-        model_dir / "sam2" / "sam2_hiera_large.pt",
         model_dir / "sam2" / "sam2.1_hiera_large.pt",
+        model_dir / "sam2" / "sam2_hiera_large.pt",
     ]
     ckpt = next((c for c in ckpt_candidates if c.exists()), None)
     if ckpt is None:
-        # Try HF hub location used by download script
-        ckpt = str(model_dir / "sam2" / "sam2_hiera_large.pt")
-        print(f"  WARNING: SAM2 checkpoint not found at expected paths; "
-              f"using {ckpt} (may fail)")
+        from huggingface_hub import hf_hub_download
+        sam2_dir = model_dir / "sam2"
+        sam2_dir.mkdir(parents=True, exist_ok=True)
+        print("[Stage 2] Downloading SAM2 checkpoint from HF ...")
+        hf_hub_download(
+            repo_id="facebook/sam2.1-hiera-large",
+            filename="sam2.1_hiera_large.pt",
+            local_dir=str(sam2_dir),
+        )
+        ckpt = sam2_dir / "sam2.1_hiera_large.pt"
 
     # Config file distributed with the SAM2 package
-    cfg = "sam2_hiera_l.yaml"   # VERIFY: exact yaml name in your SAM2 install
+    # SAM2 v2 (sam2.1) ships with updated config names
+    cfg_candidates = ["configs/sam2.1/sam2.1_hiera_l.yaml", "sam2_hiera_l.yaml"]
 
-    print(f"[Stage 2] Loading SAM2 ({cfg}) ...")
-    predictor = build_sam2_video_predictor(cfg, str(ckpt))
+    from hydra import initialize_config_dir
+    import os, importlib
+    cfg = cfg_candidates[0]   # SAM2 installed via pip uses this path
+
+    print(f"[Stage 2] Loading SAM2 ...")
+    predictor = build_sam2_video_predictor(cfg, str(ckpt), device="cuda")
 
     frame_files = sorted(frames_dir.glob("*.png"))
-    # SAM2 video predictor expects a directory of JPEG or PNG frames
-    video_dir = str(frames_dir)
+    if not frame_files:
+        frame_files = sorted(frames_dir.glob("*.jpg"))
+
+    # SAM2 requires JPEG files named as pure integers (e.g. 000001.jpg).
+    import tempfile, shutil
+    _tmp_dir = Path(tempfile.mkdtemp(prefix="sam2_frames_"))
+    for i, fp in enumerate(frame_files):
+        jpeg_path = _tmp_dir / f"{i:07d}.jpg"
+        Image.open(fp).convert("RGB").save(str(jpeg_path), quality=95)
+    video_dir = str(_tmp_dir)
+    print(f"[Stage 2] Prepared {len(frame_files)} frames for SAM2 in {_tmp_dir}")
+
+    seed_frame_idx = mask_spec.get("frame_index", 0)
 
     points_xy = np.array(
         [[p["x"], p["y"]] for p in mask_spec["points"]], dtype=np.float32
@@ -155,26 +178,50 @@ def propagate_masks(frames_dir: Path, mask_spec: dict, fg_masks_dir: Path,
         [p["label"] for p in mask_spec["points"]], dtype=np.int32
     )
 
+    masks_by_idx = {}
+
     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
         inference_state = predictor.init_state(video_path=video_dir)
 
-        # Add seed points on frame 0
-        _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
+        # Add seed points on the user-selected frame
+        predictor.add_new_points_or_box(
             inference_state=inference_state,
-            frame_idx=0,
+            frame_idx=seed_frame_idx,
             obj_id=1,
             points=points_xy,
             labels=labels,
         )
 
-        # Propagate forward through the video
+        # Propagate forward from seed frame
         for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(
-            inference_state
+            inference_state, start_frame_idx=seed_frame_idx
         ):
-            # mask_logits: (n_objs, 1, H, W)
             mask = (mask_logits[0, 0] > 0.0).cpu().numpy().astype(np.uint8) * 255
-            out_name = frame_files[frame_idx].name
-            Image.fromarray(mask).save(str(fg_masks_dir / out_name))
+            masks_by_idx[frame_idx] = mask
+
+        # Propagate backward to cover frames before the seed
+        if seed_frame_idx > 0:
+            for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(
+                inference_state, start_frame_idx=seed_frame_idx, reverse=True
+            ):
+                if frame_idx not in masks_by_idx:
+                    mask = (mask_logits[0, 0] > 0.0).cpu().numpy().astype(np.uint8) * 255
+                    masks_by_idx[frame_idx] = mask
+
+    if _tmp_dir:
+        shutil.rmtree(str(_tmp_dir), ignore_errors=True)
+
+    # Use the first mask's shape for any missing frames
+    ref_shape = next(iter(masks_by_idx.values())).shape if masks_by_idx else None
+    for i, fp in enumerate(frame_files):
+        if i in masks_by_idx:
+            mask = masks_by_idx[i]
+        elif ref_shape is not None:
+            mask = np.zeros(ref_shape, dtype=np.uint8)
+        else:
+            img_h, img_w = np.array(Image.open(fp).convert("L")).shape
+            mask = np.zeros((img_h, img_w), dtype=np.uint8)
+        Image.fromarray(mask).save(str(fg_masks_dir / fp.name))
 
     print(f"[Stage 2] SAM2 propagation done — {len(frame_files)} masks saved.")
 
@@ -311,15 +358,28 @@ def compute_flow(flow_frames_dir: Path, flow_maps_dir: Path):
         t   = TF.to_tensor(img) * 255.0       # (3, H, W) float in [0,255]
         return t.unsqueeze(0).to(device)       # (1, 3, H, W)
 
+    # RAFT requires H and W divisible by 8; pad if needed
+    def pad8(t):
+        """Pad (1, C, H, W) so H and W are multiples of 8."""
+        _, _, h, w = t.shape
+        ph = (8 - h % 8) % 8
+        pw = (8 - w % 8) % 8
+        if ph or pw:
+            import torch.nn.functional as F
+            t = F.pad(t, (0, pw, 0, ph))
+        return t, h, w   # return original dims to crop output
+
     for i in range(len(frame_files) - 1):
         img1 = load_tensor(frame_files[i])
         img2 = load_tensor(frame_files[i + 1])
+        img1, orig_h, orig_w = pad8(img1)
+        img2, _, _           = pad8(img2)
         with torch.no_grad():
             # raft_large returns a list of flow predictions; last is the best
             flow_preds = model(img1, img2)
-            flow = flow_preds[-1]              # (1, 2, H, W)
+            flow = flow_preds[-1]              # (1, 2, H_pad, W_pad)
 
-        flow_np = flow[0].permute(1, 2, 0).cpu().numpy()   # (H, W, 2)
+        flow_np = flow[0, :, :orig_h, :orig_w].permute(1, 2, 0).cpu().numpy()  # (H, W, 2)
         stem    = frame_files[i].stem
         np.save(str(flow_maps_dir / f"{stem}_to_{frame_files[i+1].stem}.npy"),
                 flow_np)
@@ -422,11 +482,56 @@ def main():
     if args.local:
         run_stage2(args.scene_dir, args.model_dir)
     else:
+        scene_dir  = Path(args.scene_dir).resolve()
         scene_name = Path(args.scene_dir).name
+
+        # Upload mask_frame0.json to Modal volume
+        mask_json = scene_dir / "mask_frame0.json"
+        if not mask_json.exists():
+            print("[Stage 2] ERROR: mask_frame0.json not found. Run seed_ui first.")
+            sys.exit(1)
+
+        print(f"[Stage 2] Uploading seed spec and frames to Modal volume ...")
+        subprocess.run(
+            [sys.executable, "-m", "modal", "volume", "put", "--force",
+             "4drecon-data", str(mask_json), f"{scene_name}/mask_frame0.json"],
+            check=True,
+        )
+        for subdir in ("frames", "flow_frames"):
+            local_subdir = scene_dir / subdir
+            if local_subdir.exists():
+                subprocess.run(
+                    [sys.executable, "-m", "modal", "volume", "put", "--force",
+                     "4drecon-data", str(local_subdir), f"{scene_name}/{subdir}"],
+                    check=True,
+                )
+
         print(f"[Stage 2] Launching Modal job for '{scene_name}' ...")
         with modal.enable_output():
             with app.run():
                 run_segmentation_remote.remote(scene_name)
+
+        # Download results
+        import shutil
+        print("[Stage 2] Downloading results ...")
+        for subdir in ("fg_masks", "fg_frames", "bg_frames", "flow_maps",
+                        "separation_meta.json"):
+            local_path = scene_dir / subdir
+            # Remove stale file/directory so modal can create the correct type
+            if local_path.exists():
+                if local_path.is_dir():
+                    shutil.rmtree(str(local_path))
+                else:
+                    local_path.unlink()
+            # Use trailing slash for remote dirs so modal downloads recursively
+            is_file = subdir.endswith(".json")
+            remote_path = f"{scene_name}/{subdir}" + ("" if is_file else "/")
+            subprocess.run(
+                [sys.executable, "-m", "modal", "volume", "get",
+                 "--force", "4drecon-data", remote_path, str(local_path)],
+                check=False,
+            )
+        print("[Stage 2] Done.")
 
 
 if __name__ == "__main__":
