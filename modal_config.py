@@ -84,7 +84,9 @@ pipeline_image = (
     # Installing just roma avoids the pip resolver backtracking that occurs when
     # trying to reconcile the full requirements.txt against already-pinned packages.
     .run_commands(
-        "git clone --depth 1 https://github.com/naver/dust3r /opt/dust3r",
+        # croco is a git submodule of DUSt3R — must recurse submodules
+        "git clone --depth 1 --recurse-submodules --shallow-submodules "
+        "https://github.com/naver/dust3r /opt/dust3r",
         "pip install --no-deps roma",
     )
     # Clone SAM2 and install

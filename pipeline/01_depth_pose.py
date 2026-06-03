@@ -21,6 +21,7 @@ Usage (local → triggers Modal run):
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -309,11 +310,41 @@ def main():
         print("[Stage 1] Running locally ...")
         run_stage1_local(args.scene_dir, args.model_dir)
     else:
-        scene_name = args.scene_name or Path(args.scene_dir).name
+        import sys
+        scene_dir  = Path(args.scene_dir).resolve()
+        scene_name = args.scene_name or scene_dir.name
+
+        # Upload local scene frames to the Modal data volume before launching
+        print(f"[Stage 1] Uploading '{scene_name}' frames to Modal volume ...")
+        for subdir in ("frames", "flow_frames"):
+            local_subdir = scene_dir / subdir
+            if local_subdir.exists():
+                subprocess.run(
+                    [sys.executable, "-m", "modal", "volume", "put",
+                     "4drecon-data", str(local_subdir), f"{scene_name}/{subdir}"],
+                    check=True,
+                )
+        meta = scene_dir / "frames_meta.json"
+        if meta.exists():
+            subprocess.run(
+                [sys.executable, "-m", "modal", "volume", "put",
+                 "4drecon-data", str(meta), f"{scene_name}/frames_meta.json"],
+                check=True,
+            )
+
         print(f"[Stage 1] Launching Modal job for scene '{scene_name}' ...")
         with modal.enable_output():
             with app.run():
                 stats = run_depth_and_pose_remote.remote(scene_name)
+
+        # Download results back to local scene dir
+        print("[Stage 1] Downloading results from Modal volume ...")
+        for subdir in ("depth", "cameras.json", "pointcloud.ply"):
+            subprocess.run(
+                [sys.executable, "-m", "modal", "volume", "get",
+                 "4drecon-data", f"{scene_name}/{subdir}", str(scene_dir / subdir)],
+                check=False,   # ok if some outputs don't exist yet
+            )
         print(f"[Stage 1] DONE  {stats}")
 
 
