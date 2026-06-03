@@ -29,7 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import modal
-from modal_config import app, pipeline_image, VOLUME_MAP, MODELS_PATH, DATA_PATH, data_volume
+from modal_config import app, pipeline_image, VOLUME_MAP, MODELS_PATH, DATA_PATH, data_volume, models_volume
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -282,8 +282,9 @@ def run_depth_and_pose_remote(scene_dir_relative: str):
     focals = run_depth_pro(frames_dir, depth_dir, model_path)
     stats  = run_dust3r(frames_dir, depth_dir, sd, model_path, focals)
 
-    # Flush volume so results are visible from outside
+    # Flush volumes so results are visible from outside
     data_volume.commit()
+    models_volume.commit()   # persist downloaded checkpoints (depth_pro.pt, etc.)
     return stats
 
 
@@ -320,14 +321,14 @@ def main():
             local_subdir = scene_dir / subdir
             if local_subdir.exists():
                 subprocess.run(
-                    [sys.executable, "-m", "modal", "volume", "put",
+                    [sys.executable, "-m", "modal", "volume", "put", "--force",
                      "4drecon-data", str(local_subdir), f"{scene_name}/{subdir}"],
                     check=True,
                 )
         meta = scene_dir / "frames_meta.json"
         if meta.exists():
             subprocess.run(
-                [sys.executable, "-m", "modal", "volume", "put",
+                [sys.executable, "-m", "modal", "volume", "put", "--force",
                  "4drecon-data", str(meta), f"{scene_name}/frames_meta.json"],
                 check=True,
             )
