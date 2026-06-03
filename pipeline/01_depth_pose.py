@@ -202,7 +202,12 @@ def run_dust3r(frames_dir: Path, depth_dir: Path, out_dir: Path, model_dir: Path
 
         # Collect dense points (subsample to keep ply manageable)
         pts = pts3d[i].detach().cpu().numpy().reshape(-1, 3)   # (H*W, 3)
-        conf_mask = conf[i].detach().cpu().numpy().flatten() > 1.5
+        # conf is at DUSt3R's internal res (e.g. 288×512); resize to original image res
+        conf_hw = conf[i].detach().cpu().numpy()               # (h, w)
+        conf_resized = cv2.resize(
+            conf_hw, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR
+        )
+        conf_mask = conf_resized.flatten() > 1.5
         pts_filt  = pts[conf_mask]
         col_filt  = img.reshape(-1, 3)[conf_mask]
 
