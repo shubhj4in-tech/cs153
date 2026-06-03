@@ -202,15 +202,15 @@ def run_dust3r(frames_dir: Path, depth_dir: Path, out_dir: Path, model_dir: Path
         cameras.append(cam)
 
         # Collect dense points (subsample to keep ply manageable)
-        pts = pts3d[i].detach().cpu().numpy().reshape(-1, 3)   # (H*W, 3)
-        # conf is at DUSt3R's internal res (e.g. 288×512); resize to original image res
-        conf_hw = conf[i].detach().cpu().numpy()               # (h, w)
-        conf_resized = cv2.resize(
-            conf_hw, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_LINEAR
-        )
-        conf_mask = conf_resized.flatten() > 1.5
+        # pts3d and conf are both at DUSt3R's internal resolution (e.g. 288×512)
+        conf_hw = conf[i].detach().cpu().numpy()               # (H_d, W_d)
+        h_d, w_d = conf_hw.shape
+        pts = pts3d[i].detach().cpu().numpy().reshape(-1, 3)   # (H_d*W_d, 3)
+        conf_mask = conf_hw.flatten() > 1.5
+        # Resize original image to DUSt3R's resolution for per-point colours
+        img_d = cv2.resize(img, (w_d, h_d), interpolation=cv2.INTER_LINEAR)
         pts_filt  = pts[conf_mask]
-        col_filt  = img.reshape(-1, 3)[conf_mask]
+        col_filt  = img_d.reshape(-1, 3)[conf_mask]
 
         # Subsample: keep at most 5000 pts per frame
         if len(pts_filt) > 5000:
