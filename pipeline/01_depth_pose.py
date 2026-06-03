@@ -183,7 +183,7 @@ def run_dust3r(frames_dir: Path, depth_dir: Path, out_dir: Path, model_dir: Path
     for i, (fp, pose, f_px_dust3r) in enumerate(
         zip(frame_files, poses, focals_dust3r)
     ):
-        pose_np = pose.cpu().numpy().tolist()
+        pose_np = pose.detach().cpu().numpy().tolist()
         f_val   = float(focals.get(fp.stem, float(f_px_dust3r)))
 
         # Read image for point colours
