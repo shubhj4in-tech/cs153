@@ -266,10 +266,10 @@ def run_stage1_local(scene_dir: str, model_dir: str):
 
 @app.function(
     image=pipeline_image,
-    gpu="A10G",
+    gpu="A100-80GB",
     volumes=VOLUME_MAP,
     timeout=3600,
-    memory=24576,
+    memory=40960,
 )
 def run_depth_and_pose_remote(scene_dir_relative: str):
     """

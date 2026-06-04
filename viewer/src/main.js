@@ -1,34 +1,32 @@
 /**
  * main.js — 4D Scene Viewer
  *
- * Strategy: cache each frame's raw .splat bytes as an ArrayBuffer.
- * On frame switch, remove the current GaussianSplats3D scene, create a
- * blob URL from the cached bytes, and load the new scene.  This avoids
- * the "all scenes merged" problem from addSplatScene accumulation.
+ * Frame switching strategy: add new scene FIRST (old stays visible),
+ * then remove old scenes — eliminates the black-flash between frames.
+ * Background prefetch keeps next frames cached for instant switching.
  */
 
 import * as GaussianSplats3D from "@mkkellogg/gaussian-splats-3d";
 import { Timeline } from "./timeline.js";
 import { Controls } from "./controls.js";
 
-// ── Config ──────────────────────────────────────────────────────────────────
+const MANIFEST_URL = "./manifest.json";
 
-const MANIFEST_URL   = "./manifest.json";
-const PRELOAD_RADIUS = 2;  // how many frames to preload ahead/behind
-
-// ── State ───────────────────────────────────────────────────────────────────
+// ── State ─────────────────────────────────────────────────────────────────────
 
 let viewer   = null;
 let manifest = null;
 let timeline = null;
 let controls = null;
+let viewerStarted = false;
 
-// Raw byte cache: frameIndex → ArrayBuffer
-const frameBuffers = new Map();
-let   currentDisplayedFrame = -1;
-let   isDisplaying = false;      // guard against concurrent displayFrame calls
+let currentDisplayedFrame = -1;
+let isDisplaying = false;
 
-// ── Loading overlay ──────────────────────────────────────────────────────────
+// ArrayBuffer cache: frameIndex → ArrayBuffer
+const frameCache = new Map();
+
+// ── Loading overlay ───────────────────────────────────────────────────────────
 
 function setLoading(visible, text = "Loading…", progress = null) {
   const overlay = document.getElementById("loading-overlay");
@@ -39,146 +37,153 @@ function setLoading(visible, text = "Loading…", progress = null) {
   if (bar && progress !== null) bar.style.width = `${Math.round(progress * 100)}%`;
 }
 
-// ── Manifest ─────────────────────────────────────────────────────────────────
+function showError(msg) {
+  const overlay = document.getElementById("loading-overlay");
+  const textEl  = document.getElementById("loading-text");
+  const bar     = document.getElementById("progress-bar");
+  if (overlay) overlay.classList.remove("hidden");
+  if (textEl)  { textEl.textContent = `⚠ ${msg}`; textEl.style.color = "#f08080"; }
+  if (bar)     bar.style.background = "#c04040";
+  console.error(msg);
+}
+
+// ── Manifest ──────────────────────────────────────────────────────────────────
 
 async function loadManifest(url) {
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Could not load manifest: ${res.status} ${url}`);
+  if (!res.ok) throw new Error(`manifest fetch failed: ${res.status}`);
   return res.json();
 }
 
-// ── Viewer setup ─────────────────────────────────────────────────────────────
+// ── Viewer ────────────────────────────────────────────────────────────────────
 
 function createViewer() {
   const container = document.getElementById("canvas-container");
   viewer = new GaussianSplats3D.Viewer({
-    rootElement:           container,
-    selfDrivenMode:        false,
-    useBuiltInControls:    true,
-    initialCameraPosition: [0, -3, 5],
-    initialCameraLookAt:   [0, 0, 0],
-    cameraUp:              [0, 1, 0],
+    rootElement:            container,
+    selfDrivenMode:         true,
+    useBuiltInControls:     true,
+    initialCameraPosition:  [-0.2, 0.0, 0.0],
+    initialCameraLookAt:    [-0.02, 0.01, 0.245],
+    cameraUp:               [0, -1, 0],
     sharedMemoryForWorkers: false,
-    gpuAcceleratedSort:    true,
-    logLevel:              GaussianSplats3D.LogLevel.None,
+    gpuAcceleratedSort:     false,
+    logLevel:               GaussianSplats3D.LogLevel.Warning,
   });
-  return viewer;
 }
 
-// ── Byte fetching (preload without parsing) ──────────────────────────────────
+// ── Splat loading ─────────────────────────────────────────────────────────────
 
-async function fetchFrame(frameIdx) {
-  if (frameBuffers.has(frameIdx)) return;
-  const file = manifest.files[frameIdx];
-  const res  = await fetch(`./${file.file}`);
-  if (!res.ok) throw new Error(`Fetch failed for frame ${frameIdx}: ${res.status}`);
-  frameBuffers.set(frameIdx, await res.arrayBuffer());
+const SPLAT_OPTS = {
+  format:                     GaussianSplats3D.SceneFormat.Splat,
+  splatAlphaRemovalThreshold: 5,
+  showLoadingUI:              false,
+  position:                   [0, 0, 0],
+  rotation:                   [0, 0, 0, 1],
+  scale:                      [1, 1, 1],
+};
+
+async function addSplatFromUrl(url) {
+  await viewer.addSplatScene(url, SPLAT_OPTS);
 }
 
-// ── Scene management ─────────────────────────────────────────────────────────
-
-async function clearAllScenes() {
-  if (!viewer) return;
-  // removeSplatScene(index) exists in GaussianSplats3D >= 0.3.x.
-  // Remove from highest index downward to avoid index shifting.
-  const nScenes = viewer.splatMesh?.scenes?.length ?? 0;
-  for (let i = nScenes - 1; i >= 0; i--) {
-    try {
-      await viewer.removeSplatScene(i, /* update = */ false);
-    } catch (_) {
-      // older builds may not have removeSplatScene — ignore
-    }
-  }
+async function addSplatFromBuffer(buf) {
+  const blob = new Blob([buf], { type: "application/octet-stream" });
+  const url  = URL.createObjectURL(blob);
+  try   { await viewer.addSplatScene(url, SPLAT_OPTS); }
+  finally { URL.revokeObjectURL(url); }
 }
 
-async function loadSceneFromBuffer(buf) {
-  const blob    = new Blob([buf], { type: "application/octet-stream" });
-  const blobUrl = URL.createObjectURL(blob);
+// ── Prefetch ──────────────────────────────────────────────────────────────────
+
+async function prefetchFrame(idx) {
+  if (!manifest || frameCache.has(idx) || idx < 0 || idx >= manifest.n_frames) return;
   try {
-    await viewer.addSplatScene(blobUrl, {
-      splatAlphaRemovalThreshold: 5,
-      showLoadingUI:              false,
-      position:                   [0, 0, 0],
-      rotation:                   [0, 0, 0, 1],
-      scale:                      [1, 1, 1],
-    });
-  } finally {
-    URL.revokeObjectURL(blobUrl);
+    const res = await fetch(`./${manifest.files[idx].file}`);
+    if (res.ok) frameCache.set(idx, await res.arrayBuffer());
+  } catch (_) {}
+}
+
+function prefetchNeighbours(center) {
+  for (let d = 1; d <= 3; d++) {
+    prefetchFrame(center + d);
+    prefetchFrame(center - d);
   }
 }
 
-// ── Display a frame ──────────────────────────────────────────────────────────
+// ── Display a frame ───────────────────────────────────────────────────────────
 
 async function displayFrame(frameIdx) {
-  if (frameIdx === currentDisplayedFrame || isDisplaying) return;
+  if (frameIdx === currentDisplayedFrame || isDisplaying) return true;
   isDisplaying = true;
-
   try {
-    if (!frameBuffers.has(frameIdx)) {
-      await fetchFrame(frameIdx);
+    // Add NEW scene first — old scene stays visible, no black flash
+    if (frameCache.has(frameIdx)) {
+      await addSplatFromBuffer(frameCache.get(frameIdx));
+    } else {
+      await addSplatFromUrl(`./${manifest.files[frameIdx].file}`);
     }
 
-    await clearAllScenes();
-    await loadSceneFromBuffer(frameBuffers.get(frameIdx));
+    // Remove all OLD scenes now that new one is showing
+    const nScenes = viewer.splatMesh?.scenes?.length ?? 0;
+    for (let i = nScenes - 2; i >= 0; i--) {
+      try { await viewer.removeSplatScene(i, false); } catch (_) {}
+    }
+
+    if (!viewerStarted) {
+      viewer.start();
+      viewerStarted = true;
+      requestAnimationFrame(renderLoop);
+    }
 
     currentDisplayedFrame = frameIdx;
-    preloadNeighbours(frameIdx);
+    prefetchNeighbours(frameIdx);
+    return true;
   } catch (err) {
-    console.error(`displayFrame(${frameIdx}) failed:`, err);
+    showError(`Frame ${frameIdx} failed: ${err.message}`);
+    return false;
   } finally {
     isDisplaying = false;
   }
 }
 
-function preloadNeighbours(center) {
-  for (let d = 1; d <= PRELOAD_RADIUS; d++) {
-    [center + d, center - d].forEach((f) => {
-      if (f >= 0 && f < manifest.n_frames && !frameBuffers.has(f)) {
-        fetchFrame(f).catch(() => {});
-      }
-    });
-  }
+// ── Render loop (timeline + FPS — viewer drives its own render) ───────────────
+
+function renderLoop() {
+  requestAnimationFrame(renderLoop);
+  timeline?.tick(performance.now() / 1000 - (renderLoop._t ?? 0));
+  renderLoop._t = performance.now() / 1000;
+  controls?.tickFps();
 }
 
 // ── File picker ───────────────────────────────────────────────────────────────
 
 async function openSceneFromPicker() {
-  const input  = document.createElement("input");
-  input.type   = "file";
+  const input = document.createElement("input");
+  input.type  = "file";
   input.accept = ".json";
   input.addEventListener("change", async () => {
     const file = input.files?.[0];
     if (!file) return;
-    const m = JSON.parse(await file.text());
-    await initScene(m);
+    try { await initScene(JSON.parse(await file.text())); }
+    catch (e) { showError(e.message); }
   });
   input.click();
 }
 
-// ── Scene initialisation ──────────────────────────────────────────────────────
+// ── Scene init ────────────────────────────────────────────────────────────────
 
 async function initScene(m) {
   manifest = m;
-  frameBuffers.clear();
   currentDisplayedFrame = -1;
+  viewerStarted = false;
+  frameCache.clear();
 
-  setLoading(true, "Creating viewer…", 0);
   if (!viewer) createViewer();
 
-  // Prefetch all frames for small scenes, otherwise just the first one.
-  const toPreload = m.n_frames <= 20
-    ? Array.from({ length: m.n_frames }, (_, i) => i)
-    : [0];
-
-  for (let i = 0; i < toPreload.length; i++) {
-    setLoading(true, `Fetching frame ${toPreload[i] + 1} / ${m.n_frames}…`,
-               (i + 1) / toPreload.length);
-    await fetchFrame(toPreload[i]);
-  }
-
-  // Display frame 0
-  setLoading(true, "Loading scene…", 1);
-  await displayFrame(0);
+  setLoading(true, `Loading frame 1 of ${m.n_frames}…`, 0);
+  const ok = await displayFrame(0);
+  if (!ok) return;
 
   timeline = new Timeline({
     nFrames:    m.n_frames,
@@ -196,18 +201,6 @@ async function initScene(m) {
   }
 
   setLoading(false);
-  requestAnimationFrame(renderLoop);
-}
-
-// ── Render loop ───────────────────────────────────────────────────────────────
-
-function renderLoop(now) {
-  requestAnimationFrame(renderLoop);
-  timeline?.tick(performance.now() / 1000 - (renderLoop._last ?? 0));
-  renderLoop._last = performance.now() / 1000;
-  viewer?.update();
-  viewer?.render();
-  controls?.tickFps();
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
@@ -215,14 +208,12 @@ function renderLoop(now) {
 async function boot() {
   document.getElementById("load-btn")
     ?.addEventListener("click", openSceneFromPicker);
-
   try {
     setLoading(true, "Looking for manifest.json…", 0);
     const m = await loadManifest(MANIFEST_URL);
     await initScene(m);
-  } catch (_) {
-    setLoading(false);
-    console.info("No manifest.json found. Click 'Load Scene' to open one.");
+  } catch (err) {
+    showError(`Could not load scene: ${err.message}`);
   }
 }
 

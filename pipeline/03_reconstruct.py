@@ -170,6 +170,8 @@ def prepare_colmap_structure(scene_dir: Path, frames_subdir: str,
     images_dir.mkdir(exist_ok=True)
     for fp in frame_files:
         dst = images_dir / name_map[fp.name]
+        if dst.is_symlink():   # remove stale/broken symlinks from prior runs
+            dst.unlink()
         if not dst.exists():
             os.symlink(str(fp.resolve()), str(dst))
 
@@ -210,8 +212,19 @@ def rotation_matrix_to_quaternion(R):
 # Background reconstruction (3DGS)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _do_reconstruct_background(scene_dir: Path):
-    """Called inside the Modal container (or --local)."""
+def _do_reconstruct_background(scene_dir: Path,
+                                start_checkpoint: str | None = None,
+                                end_iter: int = 30000,
+                                save_checkpoint_at: int | None = None):
+    """
+    One chunk of BG 3DGS training.
+
+    Args:
+        start_checkpoint: Path to a .pth checkpoint to resume from (None = fresh).
+        end_iter:         Total iteration count to reach (absolute, not relative).
+        save_checkpoint_at: If set, save optimizer checkpoint at this iteration.
+                            The file is written to output_dir/chkpnt{N}.pth.
+    """
     import wandb
 
     colmap_dir = scene_dir / "_colmap_bg"
@@ -231,23 +244,28 @@ def _do_reconstruct_background(scene_dir: Path):
         sys.executable, str(gs_train),
         "-s", str(colmap_dir),
         "-m", str(output_dir),
-        "--iterations", "30000",
-        "--densify_until_iter", "15000",
-        "--test_iterations", "7000", "15000", "30000",
-        "--save_iterations", "15000", "30000",
+        "--iterations",           str(end_iter),
+        "--densify_until_iter",   "15000",
+        "--test_iterations",      str(end_iter + 1),   # disable mid-run evals
+        "--save_iterations",      str(end_iter),
     ]
+    if start_checkpoint:
+        cmd += ["--start_checkpoint", start_checkpoint]
+    if save_checkpoint_at is not None:
+        cmd += ["--checkpoint_iterations", str(save_checkpoint_at)]
 
     wandb_key = os.environ.get("WANDB_API_KEY")
     if wandb_key:
         wandb.init(
             project=os.environ.get("WANDB_PROJECT", "4drecon"),
-            name=f"bg_gs_{scene_dir.name}",
-            config={"iterations": 30000, "mode": "background"},
+            name=f"bg_gs_{scene_dir.name}_to{end_iter}",
+            config={"end_iter": end_iter, "mode": "background"},
+            reinit=True,
         )
 
-    print(f"[Stage 3] Launching 3DGS training:\n  {' '.join(cmd)}\n")
-    result = subprocess.run(cmd, check=True)
-    print(f"[Stage 3] Background reconstruction done → {output_dir}")
+    print(f"[Stage 3] Launching 3DGS (BG) chunk → iter {end_iter}:\n  {' '.join(cmd)}\n")
+    subprocess.run(cmd, check=True)
+    print(f"[Stage 3] BG chunk done (iter {end_iter}) → {output_dir}")
 
     if wandb_key:
         wandb.finish()
@@ -378,26 +396,63 @@ def _do_reconstruct_foreground(scene_dir: Path, warm_init_path: str | None,
 
 @app.function(
     image=training_image,
-    gpu="A100",
+    gpu="A100-80GB",
     volumes=VOLUME_MAP,
-    timeout=7200,
+    timeout=600,       # 10-min hard limit — each chunk trains ~7500 iters (~5 min)
+    retries=3,
     memory=40960,
 )
+def reconstruct_background_chunk(scene_dir_relative: str,
+                                  start_checkpoint: str | None,
+                                  end_iter: int,
+                                  save_checkpoint_at: int | None):
+    """One chunk of BG 3DGS training (~7500 iters, ~5 min on A100-80GB)."""
+    sd = Path(DATA_PATH) / scene_dir_relative
+    _do_reconstruct_background(sd,
+                                start_checkpoint=start_checkpoint,
+                                end_iter=end_iter,
+                                save_checkpoint_at=save_checkpoint_at)
+    data_volume.commit()
+
+
 def reconstruct_background(scene_dir_relative: str):
     """
-    Modal function: 3DGS background reconstruction.
-    Cost estimate: ~1.5 A100-hours ($2.25)
+    Orchestrate chunked BG 3DGS training (4 × 7500 iters = 30 000 total).
+    Each chunk is a separate Modal call to stay under the ~7-8 min preemption window.
     """
-    sd = Path(DATA_PATH) / scene_dir_relative
-    _do_reconstruct_background(sd)
-    data_volume.commit()
+    DATA = Path(DATA_PATH)
+    sd   = DATA / scene_dir_relative
+    output_dir = sd / "outputs" / "bg_gaussians"
+
+    # Chunks: (end_iter, checkpoint_to_save_at)
+    # checkpoint_to_save_at = end_iter - 1 so 3DGS saves just before stopping.
+    # Final chunk saves PLY only (no checkpoint needed).
+    chunks = [
+        (7500,  7499),
+        (15000, 14999),
+        (22500, 22499),
+        (30000, None),   # final — PLY saved, no checkpoint needed
+    ]
+
+    start_ckpt = None
+    for end_iter, ckpt_iter in chunks:
+        print(f"[Stage 3 BG] Running chunk 0 → {end_iter} ...")
+        reconstruct_background_chunk.remote(
+            scene_dir_relative, start_ckpt, end_iter, ckpt_iter
+        )
+        # Next chunk resumes from the checkpoint we just saved (on the volume).
+        if ckpt_iter is not None:
+            start_ckpt = str(output_dir / f"chkpnt{ckpt_iter}.pth")
+
+    print("[Stage 3 BG] All chunks complete.")
 
 
 @app.function(
     image=training_image_fg,
-    gpu="A100",
+    gpu="A100-80GB",
     volumes=VOLUME_MAP,
     timeout=7200,
+    retries=5,
     memory=40960,
 )
 def reconstruct_foreground(scene_dir_relative: str,
@@ -433,6 +488,9 @@ def main():
                              "use 500 with --warm-init)")
     parser.add_argument("--local", action="store_true",
                         help="Run locally without Modal")
+    parser.add_argument("--bg-start-chunk", type=int, default=1,
+                        help="BG chunk to start from (1-4). Use 3 to resume from chkpnt14999.pth, "
+                             "4 to resume from chkpnt22499.pth. (default: 1)")
     args = parser.parse_args()
 
     sd = Path(args.scene_dir)
@@ -444,19 +502,56 @@ def main():
             _do_reconstruct_foreground(sd, args.warm_init, args.fg_iterations)
     else:
         scene_name = sd.name
+        bg_output = sd / "outputs" / "bg_gaussians"
+
+        # Upload bg_frames/ and fg_frames/ to the Modal volume if they exist locally
+        print(f"[Stage 3] Uploading scene frames to Modal volume ...")
+        for subdir in ("bg_frames", "fg_frames"):
+            local_subdir = sd / subdir
+            if local_subdir.exists():
+                subprocess.run(
+                    [sys.executable, "-m", "modal", "volume", "put", "--force",
+                     "4drecon-data", str(local_subdir), f"{scene_name}/{subdir}"],
+                    check=True,
+                )
+                print(f"  Uploaded {subdir}/")
+
         print(f"[Stage 3] Launching Modal jobs for scene '{scene_name}' ...")
+
+        # BG: run as 4 sequential chunks of 7500 iters each to stay under
+        # Modal's ~7-8 min GPU preemption window (~5 min per chunk at ~25 it/s).
+        ALL_BG_CHUNKS = [(7500, 7499), (15000, 14999), (22500, 22499), (30000, None)]
+        start_chunk = max(1, min(args.bg_start_chunk, 4))
+        BG_CHUNKS = ALL_BG_CHUNKS[start_chunk - 1:]
+        # Determine starting checkpoint based on which chunk we resume from
+        _ckpt_map = {1: None, 2: 7499, 3: 14999, 4: 22499}
+        start_ckpt_iter = _ckpt_map[start_chunk]
+        init_ckpt = (str(Path(DATA_PATH) / scene_name / "outputs" / "bg_gaussians" /
+                         f"chkpnt{start_ckpt_iter}.pth")
+                     if start_ckpt_iter is not None else None)
+
         with modal.enable_output():
             with app.run():
-                handles = []
                 if args.mode in ("bg", "both"):
-                    handles.append(("bg", reconstruct_background.spawn(scene_name)))
+                    start_ckpt = init_ckpt
+                    for chunk_offset, (end_iter, ckpt_iter) in enumerate(BG_CHUNKS):
+                        chunk_idx = start_chunk - 1 + chunk_offset
+                        print(f"[Stage 3 BG] Chunk {chunk_idx+1}/4: training to iter {end_iter} ...")
+                        h = reconstruct_background_chunk.spawn(
+                            scene_name, start_ckpt, end_iter, ckpt_iter)
+                        h.get()
+                        if ckpt_iter is not None:
+                            start_ckpt = str(Path(DATA_PATH) / scene_name /
+                                             "outputs" / "bg_gaussians" /
+                                             f"chkpnt{ckpt_iter}.pth")
+                        print(f"[Stage 3 BG] Chunk {chunk_idx+1}/4 done.")
+
                 if args.mode in ("fg", "both"):
-                    handles.append(("fg", reconstruct_foreground.spawn(
-                        scene_name, args.warm_init, args.fg_iterations)))
-                for label, h in handles:
-                    print(f"[Stage 3] Waiting for {label} reconstruction ...")
+                    print("[Stage 3 FG] Training foreground ...")
+                    h = reconstruct_foreground.spawn(
+                        scene_name, args.warm_init, args.fg_iterations)
                     h.get()
-                    print(f"[Stage 3] {label} reconstruction done.")
+                    print("[Stage 3 FG] Done.")
 
         # Download outputs from Modal volume
         print("[Stage 3] Downloading reconstruction outputs ...")

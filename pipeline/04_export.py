@@ -46,6 +46,7 @@ import torch
 
 MAX_FILE_BYTES = 15 * 1024 * 1024   # 15 MB
 SPLAT_BYTES_PER_GAUSSIAN = 32
+_OPACITY_BOOST = 0.0  # set via --opacity-boost arg before calling pack_splat
 
 
 def pack_splat(positions: np.ndarray, scales: np.ndarray, colors: np.ndarray,
@@ -67,7 +68,7 @@ def pack_splat(positions: np.ndarray, scales: np.ndarray, colors: np.ndarray,
     buf = bytearray(N * SPLAT_BYTES_PER_GAUSSIAN)
 
     # Sigmoid opacity → alpha in [0,255]
-    alpha   = (1.0 / (1.0 + np.exp(-opacities.astype(np.float64))))
+    alpha   = (1.0 / (1.0 + np.exp(-(opacities.astype(np.float64) + _OPACITY_BOOST))))
     alpha_u8 = np.clip(alpha * 255, 0, 255).astype(np.uint8)
 
     # Colors: apply sigmoid (stored as SH DC term, scale = 0.282)
@@ -223,12 +224,15 @@ def load_deformable_gaussians(fg_ckpt_dir: Path, timestamp: float) -> dict:
 # Merge + prune to target file size
 # ─────────────────────────────────────────────────────────────────────────────
 
-def merge_and_prune(bg: dict, fg: dict, max_bytes: int = MAX_FILE_BYTES) -> dict:
+def merge_and_prune(bg: dict, fg: dict | None, max_bytes: int = MAX_FILE_BYTES) -> dict:
     """Concatenate BG and FG Gaussians, then prune low-opacity ones to fit budget."""
-    merged = {
-        k: np.concatenate([bg[k], fg[k]], axis=0)
-        for k in ["positions", "colors", "opacities", "scales", "rotations"]
-    }
+    if fg is None:
+        merged = {k: bg[k].copy() for k in ["positions", "colors", "opacities", "scales", "rotations"]}
+    else:
+        merged = {
+            k: np.concatenate([bg[k], fg[k]], axis=0)
+            for k in ["positions", "colors", "opacities", "scales", "rotations"]
+        }
 
     N      = len(merged["positions"])
     budget = max_bytes // SPLAT_BYTES_PER_GAUSSIAN
@@ -247,9 +251,12 @@ def merge_and_prune(bg: dict, fg: dict, max_bytes: int = MAX_FILE_BYTES) -> dict
 # Main export loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-def export_scene(bg_ckpt_dir: Path, fg_ckpt_dir: Path,
+def export_scene(bg_ckpt_dir: Path, fg_ckpt_dir: Path | None,
                  output_dir: Path, timestamps: list[float]):
-    """Export one .splat per timestamp and write manifest.json."""
+    """Export one .splat per timestamp and write manifest.json.
+
+    If fg_ckpt_dir is None (--no-fg mode), each frame is just the BG Gaussians.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[Stage 4] Loading background Gaussians from {bg_ckpt_dir} ...")
@@ -266,8 +273,11 @@ def export_scene(bg_ckpt_dir: Path, fg_ckpt_dir: Path,
     for i, t in enumerate(timestamps):
         print(f"  Frame {i+1}/{len(timestamps)}  t={t:.4f}", end="\r")
 
-        fg = load_deformable_gaussians(fg_ckpt_dir, timestamp=t)
-        merged = merge_and_prune(bg, fg)
+        if fg_ckpt_dir is None:
+            merged = merge_and_prune(bg, None)
+        else:
+            fg = load_deformable_gaussians(fg_ckpt_dir, timestamp=t)
+            merged = merge_and_prune(bg, fg)
 
         splat_bytes = pack_splat(
             merged["positions"],
@@ -326,7 +336,14 @@ def main():
                         help="Output directory for .splat files + manifest.json")
     parser.add_argument("--n-frames",  type=int, default=60,
                         help="Number of exported timesteps (default: 60)")
+    parser.add_argument("--opacity-boost", type=float, default=0.0,
+                        help="Add this value to raw (pre-sigmoid) opacity to compensate for undertrained checkpoints")
+    parser.add_argument("--no-fg", action="store_true",
+                        help="Skip foreground Gaussians — export BG-only static scene")
     args = parser.parse_args()
+
+    global _OPACITY_BOOST
+    _OPACITY_BOOST = args.opacity_boost
 
     # ── Resolve checkpoint paths ──────────────────────────────────────────────
     if args.bg_ckpt:
@@ -336,12 +353,14 @@ def main():
     else:
         parser.error("Provide either --scene-dir or both --bg-ckpt and --fg-ckpt")
 
-    if args.fg_ckpt:
+    if args.no_fg:
+        fg_ckpt = None
+    elif args.fg_ckpt:
         fg_ckpt = Path(args.fg_ckpt)
     elif args.scene_dir:
         fg_ckpt = find_ckpt_dir(Path(args.scene_dir) / "outputs" / "fg_gaussians")
     else:
-        parser.error("Provide either --scene-dir or both --bg-ckpt and --fg-ckpt")
+        parser.error("Provide either --scene-dir or both --bg-ckpt and --fg-ckpt, or use --no-fg")
 
     # ── Get video duration from frames_meta.json if available ────────────────
     duration = 30.0  # default
@@ -353,7 +372,6 @@ def main():
 
     timestamps = [round(duration * i / (args.n_frames - 1), 6)
                   for i in range(args.n_frames)]
-    # Normalise to [0, 1] for the deformation MLP
     norm_timestamps = [t / duration for t in timestamps]
 
     export_scene(bg_ckpt, fg_ckpt, Path(args.output), norm_timestamps)
