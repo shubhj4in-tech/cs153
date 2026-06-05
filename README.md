@@ -4,6 +4,10 @@
 
 A complete end-to-end pipeline that turns a 30-second phone video into a navigable 4D scene (3D + time) viewable in a browser. Static backgrounds are reconstructed with 3D Gaussian Splatting; dynamic foreground objects are handled by Deformable-3DGS. The novel research contribution is a fine-tuned CogVideoX-5b model whose internal motion features warm-initialize the Deformable-3DGS deformation MLP, collapsing 30-minute foreground training into under 2 minutes.
 
+## Demo
+
+<video src="https://github.com/shubhj4in-tech/cs153/releases/download/v1.0/CS.153.mp4" controls width="100%"></video>
+
 ---
 
 ## Prerequisites
