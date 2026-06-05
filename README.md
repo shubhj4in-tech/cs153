@@ -49,13 +49,13 @@ python pipeline/run_pipeline.py \
 
 **Important:** Stage 2 will pause and ask you to run the interactive SAM2 seeding step before it can continue (see Stage 2 below).
 
-### Stage-by-stage
+### Stage-by-stage (dynamic scene with moving foreground)
 
 ```bash
-# Stage 0: Extract frames
+# Stage 0: Extract frames (2fps reconstruction + full-fps flow)
 python pipeline/00_extract_frames.py --input video.mp4 --output ./scene/
 
-# Stage 1: Depth maps + camera poses  (runs on Modal A10G)
+# Stage 1: Depth maps + camera poses  (runs on Modal A100-80GB)
 python pipeline/01_depth_pose.py --scene-dir ./scene/
 # Add --local to run on your own GPU
 
@@ -65,11 +65,37 @@ python pipeline/02_segment.py --scene-dir ./scene/ --interactive
 # Then run the full segmentation:
 python pipeline/02_segment.py --scene-dir ./scene/
 
-# Stage 3: Reconstruction  (runs on Modal A100 — ~$5)
+# Stage 3: Reconstruction  (runs on Modal A100-80GB — ~$5)
+# BG trains in 4 × 7500-iter chunks to avoid Modal GPU preemption.
+# Resume from a specific chunk if the connection drops:
 python pipeline/03_reconstruct.py --scene-dir ./scene/ --mode both
+# To resume after a connection drop (e.g. completed chunks 1–2):
+python pipeline/03_reconstruct.py --scene-dir ./scene/ --mode bg --bg-start-chunk 3
 
 # Stage 4: Export to .splat files
 python pipeline/04_export.py --scene-dir ./scene/ --output ./viewer/public/
+```
+
+### Static / orbit scene (no foreground segmentation needed)
+
+For videos where the camera moves around a static object, skip Stage 2:
+
+```bash
+# Stage 0: Extract at 4fps for more training views
+python pipeline/00_extract_frames.py --input orbit.mp4 --output ./scene/ --fps 4
+
+# Stage 1: same as above
+python pipeline/01_depth_pose.py --scene-dir ./scene/
+
+# Stage 2: skip — copy frames/ to bg_frames/ manually
+cp -r ./scene/frames/ ./scene/bg_frames/
+
+# Stage 3: background only
+python pipeline/03_reconstruct.py --scene-dir ./scene/ --mode bg
+
+# Stage 4: BG-only export with optional opacity boost
+python pipeline/04_export.py --scene-dir ./scene/ --output ./viewer/public/ \
+    --no-fg --opacity-boost 1.5
 ```
 
 ---
@@ -80,9 +106,9 @@ python pipeline/04_export.py --scene-dir ./scene/ --output ./viewer/public/
 |-------|--------|-------------|
 | 0 | `00_extract_frames.py` | Splits video into 2fps reconstruction frames and full-fps optical-flow frames at 960×540 |
 | 1 | `01_depth_pose.py` | Runs Apple Depth-Pro for metric depth, then DUSt3R for camera poses; outputs `cameras.json` and an initial point cloud |
-| 2 | `02_segment.py` | SAM2 propagates your clicked mask across all frames; RAFT computes dense optical flow; produces `bg_frames/`, `fg_frames/`, `fg_masks/`, `flow_maps/` |
-| 3 | `03_reconstruct.py` | 3DGS trains on the static background (30k iters); Deformable-3DGS trains on the foreground (30k baseline or 500 with warm-init) |
-| 4 | `04_export.py` | Merges BG + time-deformed FG Gaussians into one `.splat` file per timestep, plus `manifest.json` |
+| 2 | `02_segment.py` | SAM2 propagates your clicked mask across all frames; RAFT computes dense optical flow; produces `bg_frames/`, `fg_frames/`, `fg_masks/`, `flow_maps/`. **Skip with `--no-fg` for static scenes.** |
+| 3 | `03_reconstruct.py` | 3DGS trains on the static background in 4 × 7500-iter chunks (avoids GPU preemption); Deformable-3DGS trains on the foreground (30k baseline or 500 with warm-init). Use `--mode bg` for static scenes. |
+| 4 | `04_export.py` | Merges BG + time-deformed FG Gaussians into one `.splat` file per timestep, plus `manifest.json`. `--no-fg` for BG-only export; `--opacity-boost N` to compensate for undertrained opacity. |
 
 ---
 
@@ -175,15 +201,17 @@ python eval/visualize.py \
 
 | Step | GPU | Est. cost |
 |------|-----|-----------|
-| Stage 1 (depth + pose) | A10G | $0.04 |
+| Stage 1 (depth + pose, ≤31 frames) | A100-80GB | $0.10 |
 | Stage 2 (SAM2 + RAFT) | A10G | $0.05 |
-| Stage 3 BG (3DGS 30k iter) | A100 | $2.25 |
-| Stage 3 FG baseline (30k) | A100 | $2.25 |
-| Stage 3 FG warm-init (500) | A100 | $0.04 |
+| Stage 3 BG (3DGS 30k iter, 4 chunks) | A100-80GB | $2.50 |
+| Stage 3 FG baseline (30k) | A100-80GB | $2.50 |
+| Stage 3 FG warm-init (500) | A100-80GB | $0.04 |
 | CogVideoX fine-tuning (5k steps) | A100 | $9.00 |
 | Feature extraction | A10G | $0.09 |
 | Warm-init projection training | T4 | $0.02 |
 | **Total (warm-init path)** | | **~$14** |
+
+> **Note:** Stage 1 was upgraded from A10G to A100-80GB to handle DUSt3R's O(n²) memory cost for ≥20 frames. Stage 3 BG runs as 4 sequential 7500-iter chunks to avoid the ~8-minute GPU preemption window on Modal.
 
 ---
 
