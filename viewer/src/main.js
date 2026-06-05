@@ -178,7 +178,7 @@ function setActiveBtn(id) {
   document.querySelectorAll(".scene-btn").forEach(b => {
     b.classList.toggle("active", b.dataset.scene === id);
   });
-  // Hide timeline for demo scenes, show for my_scene
+  // Hide timeline for demo/static scenes, show only for my_scene (4D timeline)
   const timelineEl = document.getElementById("timeline-container");
   if (timelineEl) timelineEl.style.display = (id === "my_scene") ? "" : "none";
 }
@@ -214,7 +214,7 @@ async function loadMyScene() {
   createViewer([-0.112, -0.002, 0.088], [-0.022, 0.004, 0.26]);
 
   try {
-    // Load full-quality PLY (300k Gaussians with spherical harmonics, view-dependent color)
+    // Load full-quality PLY (500k Gaussians with spherical harmonics, view-dependent color)
     await addScene("./my_scene.ply");
     viewer.start();
     viewerStarted = true;
@@ -222,6 +222,27 @@ async function loadMyScene() {
     setLoading(false);
   } catch (err) {
     showError(`Pipeline output failed: ${err.message}`);
+  }
+}
+
+async function loadReferenceScene() {
+  if (activeSceneId === "ref_scene") return;
+  activeSceneId = "ref_scene";
+  setActiveBtn("ref_scene");
+  destroyViewer();
+  setLoading(true, "Loading reference scene…", 0);
+
+  // Camera at mean training position for my_scene dataset
+  createViewer([0.003, 0.0, 0.04], [0.016, 0.005, 0.30]);
+
+  try {
+    await addScene("./my_scene_v1.ply");
+    viewer.start();
+    viewerStarted = true;
+    requestAnimationFrame(renderLoop);
+    setLoading(false);
+  } catch (err) {
+    showError(`Reference scene failed: ${err.message}`);
   }
 }
 
@@ -246,6 +267,13 @@ function buildScenePicker() {
   myBtn.textContent  = "My Scene";
   myBtn.addEventListener("click", loadMyScene);
   bar.appendChild(myBtn);
+
+  const refBtn = document.createElement("button");
+  refBtn.className    = "ctrl-btn scene-btn";
+  refBtn.dataset.scene = "ref_scene";
+  refBtn.textContent  = "Reference";
+  refBtn.addEventListener("click", loadReferenceScene);
+  bar.appendChild(refBtn);
 }
 
 // ── Boot ───────────────────────────────────────────────────────────────────────
