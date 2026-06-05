@@ -214,15 +214,15 @@
   <!-- Top bar -->
   <div id="top-bar">
     <div id="title">4D Scene Viewer</div>
+    <div id="scene-picker" style="display:flex;gap:8px;pointer-events:all;"></div>
     <div id="top-right">
       <span id="timestamp-display">t = 0.000s</span>
       <span id="fps-counter">— fps</span>
-      <button id="load-btn">Load Scene</button>
     </div>
   </div>
 
-  <!-- Bottom timeline -->
-  <div id="timeline-container">
+  <!-- Bottom timeline (hidden for static demo scenes, shown for My Scene) -->
+  <div id="timeline-container" style="display:none;">
     <div id="timeline-controls">
       <button class="ctrl-btn" id="play-btn">▶</button>
       <button class="ctrl-btn" id="loop-btn">⟳ Loop</button>
