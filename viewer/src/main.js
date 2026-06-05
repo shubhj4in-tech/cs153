@@ -214,26 +214,11 @@ async function loadMyScene() {
   createViewer([-0.112, -0.002, 0.088], [-0.022, 0.004, 0.26]);
 
   try {
-    const m = await (await fetch(MANIFEST_URL)).json();
-    manifest = m;
-    const ok = await displayFrame(0);
-    if (!ok) return;
-
-    timeline = new Timeline({
-      nFrames:    m.n_frames,
-      timestamps: m.timestamps ?? Array.from({ length: m.n_frames }, (_, i) => i),
-      onSeek:     (f) => displayFrame(f),
-    });
-
-    if (viewer.camera) {
-      controls = new Controls({
-        camera:        viewer.camera,
-        renderer:      viewer.renderer,
-        orbitControls: viewer.orbitControls ?? null,
-      });
-      controls.saveHomeCamera();
-    }
-
+    // Load full-quality PLY (300k Gaussians with spherical harmonics, view-dependent color)
+    await addScene("./my_scene.ply");
+    viewer.start();
+    viewerStarted = true;
+    requestAnimationFrame(renderLoop);
     setLoading(false);
   } catch (err) {
     showError(`Pipeline output failed: ${err.message}`);
