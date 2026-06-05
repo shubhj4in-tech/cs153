@@ -6,7 +6,7 @@ A complete end-to-end pipeline that turns a 30-second phone video into a navigab
 
 ## Demo
 
-<video src="https://github.com/shubhj4in-tech/cs153/releases/download/v1.0/CS.153.mp4" controls width="100%"></video>
+> **[▶ Watch Demo Video (488 MB MP4)](https://github.com/shubhj4in-tech/cs153/releases/download/v1.0/CS.153.mp4)**
 
 ---
 
