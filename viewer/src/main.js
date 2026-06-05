@@ -68,6 +68,7 @@ function showError(msg) {
 function destroyViewer() {
   if (!viewer) return;
   try { viewer.stop?.(); } catch (_) {}
+  try { viewer.dispose?.(); } catch (_) {}
   viewer = null;
   viewerStarted = false;
   currentDisplayedFrame = -1;
@@ -100,7 +101,7 @@ function createViewer(cameraPosition = null, cameraLookAt = null) {
 
 async function addScene(path, format = null) {
   const opts = {
-    splatAlphaRemovalThreshold: 5,
+    splatAlphaRemovalThreshold: 10,
     showLoadingUI:              false,
     position:                   [0, 0, 0],
     rotation:                   [0, 0, 0, 1],
@@ -209,7 +210,8 @@ async function loadMyScene() {
   destroyViewer();
   setLoading(true, "Loading pipeline output…", 0);
 
-  createViewer([-0.2, 0.0, 0.0], [-0.02, 0.01, 0.245]);
+  // Camera at mean training position, looking at scene center
+  createViewer([-0.112, -0.002, 0.088], [-0.022, 0.004, 0.26]);
 
   try {
     const m = await (await fetch(MANIFEST_URL)).json();
